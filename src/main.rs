@@ -1,4 +1,5 @@
 mod config;
+mod discovery;
 
 use anyhow::{Result, bail};
 use config::{Config, Room};
