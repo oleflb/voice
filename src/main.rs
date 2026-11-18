@@ -3,6 +3,7 @@ mod call;
 mod config;
 mod discovery;
 mod lobby;
+mod ui;
 
 use anyhow::{Result, bail};
 use config::{Config, Room};
