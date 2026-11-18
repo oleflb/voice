@@ -546,4 +546,329 @@ impl View {
             );
         }
     }
+
+    fn key(&mut self, event: impl Into<KeyEvent>, lobby: &mut Lobby) -> Result<bool> {
+        let event = event.into();
+        let key = event.code;
+        if event.modifiers == KeyModifiers::CONTROL && key == KeyCode::Char('c') {
+            return Ok(false);
+        }
+        if event.modifiers == KeyModifiers::ALT
+            && let Some(forward) = direction(key)
+        {
+            self.move_focus(forward, lobby);
+            return Ok(true);
+        }
+        if !(event.modifiers - KeyModifiers::SHIFT).is_empty() {
+            return Ok(true);
+        }
+        if matches!(self.form, Some(Form::Delete)) {
+            match key {
+                KeyCode::Char('y') => match lobby.remove_room(self.room) {
+                    Ok(()) => {
+                        self.room = self.room.min(lobby.config.rooms.len().saturating_sub(1));
+                        if lobby.active.borrow().is_none() {
+                            self.peer = None;
+                            self.chat_input = TextEdit::default();
+                            self.chat_scroll = 0;
+                        }
+                        self.form = None;
+                    }
+                    Err(error) => self.notice = format!("Could not delete session: {error}"),
+                },
+                KeyCode::Char('n') | KeyCode::Esc => self.form = None,
+                _ => {}
+            }
+            return Ok(true);
+        }
+        if let Some(Form::Share(invite)) = &self.form {
+            match key {
+                KeyCode::Char('c') => {
+                    use crossterm::clipboard::{
+                        ClipboardSelection, ClipboardType, CopyToClipboard,
+                    };
+                    let command = CopyToClipboard {
+                        content: invite,
+                        destination: ClipboardSelection(vec![ClipboardType::Clipboard]),
+                    };
+                    self.notice = match crossterm::execute!(std::io::stdout(), command) {
+                        Ok(()) => {
+                            "Copy requested. If unsupported, select and copy the invite above."
+                                .into()
+                        }
+                        Err(error) => error.to_string(),
+                    };
+                }
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.form = None;
+                    self.draft = None;
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+        let active = lobby.active.borrow().clone();
+        if let Some(draft) = &mut self.draft {
+            match key {
+                KeyCode::Esc => {
+                    if matches!(self.form, Some(Form::Name)) {
+                        return Ok(false);
+                    }
+                    self.form = None;
+                    self.draft = None;
+                }
+                KeyCode::Enter => {
+                    draft.error.clear();
+                    if let Err(error) = self.submit(lobby) {
+                        self.notice = error.to_string();
+                    }
+                }
+                _ => draft.key(key),
+            }
+            return Ok(true);
+        }
+        if self.focus == Pane::Chat {
+            match key {
+                KeyCode::Enter => {
+                    if let Some(call) = active
+                        && valid(&self.chat_input.text, 1024)
+                    {
+                        let text = std::mem::take(&mut self.chat_input).text;
+                        let mut state = call.state.lock();
+                        state.log(format!("{}: {text}", call.name));
+                        state.broadcast(Message::Chat(text));
+                        self.chat_scroll = 0;
+                    }
+                }
+                KeyCode::Up => self.chat_scroll = self.chat_scroll.saturating_add(1),
+                KeyCode::Down => self.chat_scroll = self.chat_scroll.saturating_sub(1),
+                KeyCode::Esc => self.focus = Pane::People,
+                _ => self.chat_input.key(key),
+            }
+            return Ok(true);
+        }
+        if let Some(forward) = direction(key) {
+            if self.focus == Pane::People {
+                if let Some(call) = active {
+                    let state = call.state.lock();
+                    let peers = &state.peers;
+                    let index = peers
+                        .keys()
+                        .position(|id| Some(*id) == self.peer)
+                        .map_or(0, |i| {
+                            if forward {
+                                (i + 1).min(peers.len() - 1)
+                            } else {
+                                i.saturating_sub(1)
+                            }
+                        });
+                    self.peer = peers.keys().nth(index).copied();
+                }
+            } else if forward {
+                self.room = (self.room + 1).min(lobby.config.rooms.len().saturating_sub(1));
+            } else {
+                self.room = self.room.saturating_sub(1);
+            }
+            return Ok(true);
+        }
+        match key {
+            KeyCode::Char('q') => return Ok(false),
+            KeyCode::Char('d') | KeyCode::Delete
+                if self.focus == Pane::Sessions && self.room < lobby.config.rooms.len() =>
+            {
+                self.edit(Form::Delete)
+            }
+            KeyCode::Char('n') => self.edit(Form::RoomName),
+            KeyCode::Char('i') => self.edit(Form::Import),
+            KeyCode::Char('s') => {
+                if let Some(room) = lobby.config.rooms.get(self.room) {
+                    self.edit(Form::Share(room.invite()?));
+                }
+            }
+            KeyCode::Enter if self.focus == Pane::Sessions => {
+                if lobby.join(self.room)? {
+                    self.peer = None;
+                    self.chat_input = TextEdit::default();
+                    self.chat_scroll = 0;
+                }
+                if lobby.active.borrow().is_some() {
+                    self.focus = Pane::People;
+                }
+            }
+            KeyCode::Esc => {
+                lobby.leave();
+                self.focus = Pane::Sessions;
+                self.chat_input = TextEdit::default();
+            }
+            _ => {
+                if let Some(call) = active {
+                    let mut state = call.state.lock();
+                    match key {
+                        KeyCode::Char('t') => self.focus = Pane::Chat,
+                        _ if !state.audio_available => {}
+                        KeyCode::Char('m') => state.toggle_mute(),
+                        KeyCode::Char(ch @ ('[' | ']')) => adjust(&mut state.master, ch == ']'),
+                        KeyCode::Char(ch @ (',' | '.')) => adjust(&mut state.gain, ch == '.'),
+                        KeyCode::Char(ch @ ('+' | '-' | 'x')) if self.focus == Pane::People => {
+                            if let Some(peer) = self.peer.and_then(|id| state.peers.get_mut(&id)) {
+                                if ch == 'x' {
+                                    peer.local_mute = !peer.local_mute;
+                                } else {
+                                    adjust(&mut peer.volume, ch == '+');
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+pub fn run(lobby: &mut Lobby) -> Result<()> {
+    let mut terminal = ratatui::try_init()?;
+    let mut view = View::default();
+    if lobby.config.name.is_empty() {
+        view.edit(Form::Name);
+    }
+    let result = (|| {
+        crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste)?;
+        loop {
+            terminal.draw(|frame| view.draw(frame, lobby))?;
+            if !event::poll(Duration::from_millis(150))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Paste(text) => {
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    let input = if view.form.is_none() && view.focus == Pane::Chat {
+                        Some(&mut view.chat_input)
+                    } else {
+                        view.draft.as_mut()
+                    };
+                    if let Some(edit) = input {
+                        edit.insert(text);
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release && !view.key(key, lobby)? =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
+    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+    ratatui::restore();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::{Endpoint, RelayMode, endpoint::presets};
+
+    #[test]
+    fn edit_in_the_middle_of_unicode_text() {
+        let mut edit = TextEdit::default();
+        edit.insert("a👩‍💻z");
+        edit.key(KeyCode::Left);
+        edit.key(KeyCode::Backspace);
+        edit.insert("界e\u{301}");
+        edit.key(KeyCode::Left);
+        edit.key(KeyCode::Delete);
+        assert_eq!(edit.text, "a界z");
+        edit.insert(&"x".repeat(1024));
+        assert!(edit.error.contains("1024"));
+        edit.insert("\n");
+        assert!(edit.error.contains("one line"));
+        assert_eq!(&edit.text[..edit.cursor], "a界");
+    }
+
+    #[tokio::test]
+    async fn two_temporary_clients_can_share_a_room_from_the_lobby() -> Result<()> {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await?;
+        let mut first = Lobby::start(endpoint.clone(), config::Config::open(true)?, false);
+        let mut second = Lobby::start(endpoint.clone(), config::Config::open(true)?, false);
+        assert_ne!(first.config.identity, second.config.identity);
+        let mut view = View::default();
+        view.edit(Form::Name);
+        view.draft.as_mut().unwrap().insert(&"é".repeat(33));
+        assert!(view.draft.as_ref().unwrap().error.contains("64"));
+        view.draft.as_mut().unwrap().insert("Alice");
+        view.submit(&mut first)?;
+        view.key(KeyCode::Char('n'), &mut first)?;
+        view.draft.as_mut().unwrap().insert("Friday");
+        view.submit(&mut first)?;
+        let Some(Form::Share(invite)) = view.form.take() else {
+            panic!("missing invite")
+        };
+
+        view.edit(Form::Import);
+        view.draft.as_mut().unwrap().insert(&invite);
+        view.submit(&mut second)?;
+        assert_eq!(first.config.rooms[0].secret, second.config.rooms[0].secret);
+        let call = crate::call::Call::new(first.config.rooms[0].clone(), "Alice".into());
+        first.active.send_replace(Some(call.clone()));
+        view.chat_input.insert("pending");
+        view.key(KeyCode::Enter, &mut first)?;
+        assert!(std::sync::Arc::ptr_eq(
+            first.active.borrow().as_ref().unwrap(),
+            &call
+        ));
+        assert_eq!(std::mem::take(&mut view.chat_input).text, "pending");
+        assert!(view.focus == Pane::People);
+        view.move_focus(true, &first);
+        view.key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut first,
+        )?;
+        for text in ["jkl", "hello"] {
+            for ch in text.chars() {
+                view.key(KeyCode::Char(ch), &mut first)?;
+            }
+            view.key(KeyCode::Enter, &mut first)?;
+        }
+        assert!(view.focus == Pane::Chat);
+        assert!(
+            call.state
+                .lock()
+                .chat
+                .iter()
+                .map(|s| s.as_ref())
+                .eq(["Alice: jkl", "Alice: hello"])
+        );
+        call.state.lock().log("wrapped message ".repeat(40));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20))?;
+        view.chat_scroll = u16::MAX;
+        terminal.draw(|f| view.draw(f, &first))?;
+        let top = view.chat_scroll;
+        assert!((1..u16::MAX).contains(&top));
+        view.key(KeyCode::Up, &mut first)?;
+        terminal.draw(|f| view.draw(f, &first))?;
+        view.key(KeyCode::Down, &mut first)?;
+        assert_eq!(view.chat_scroll, top - 1);
+        view.focus = Pane::Sessions;
+        view.key(KeyCode::Delete, &mut first)?;
+        terminal.draw(|f| view.draw(f, &first))?;
+        view.key(KeyCode::Enter, &mut first)?;
+        view.key(KeyCode::Esc, &mut first)?;
+        assert_eq!(first.config.rooms.len(), 1);
+        assert!(first.active.borrow().is_some());
+        view.key(KeyCode::Char('d'), &mut first)?;
+        view.key(KeyCode::Char('y'), &mut first)?;
+        assert!(first.config.rooms.is_empty() && first.rosters.is_empty());
+        assert!(first.active.borrow().is_none());
+        assert_eq!(second.config.rooms.len(), 1);
+        assert!(config::Config::open(true)?.rooms.is_empty());
+        endpoint.close().await;
+        Ok(())
+    }
 }
