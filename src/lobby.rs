@@ -13,6 +13,9 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinSet, time::timeout};
 
+#[cfg(test)]
+mod local_integration;
+
 const FALLBACK_DELAY: Duration = Duration::from_secs(3);
 
 pub struct Lobby {
