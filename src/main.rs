@@ -2,6 +2,7 @@ mod audio;
 mod call;
 mod config;
 mod discovery;
+mod lobby;
 
 use anyhow::{Result, bail};
 use config::{Config, Room};
