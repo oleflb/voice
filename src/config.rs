@@ -1,0 +1,199 @@
+use anyhow::{Context, Result, ensure};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+use directories::ProjectDirs;
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Room {
+    pub name: String,
+    pub secret: [u8; 32],
+}
+
+pub fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system random source");
+    bytes
+}
+pub fn valid(s: &str, max: usize) -> bool {
+    !s.trim().is_empty() && s.len() <= max && !s.chars().any(char::is_control)
+}
+
+impl Room {
+    pub fn key(&self, label: &[u8]) -> [u8; 32] {
+        hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &self.secret), label)
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
+    pub fn invite(&self) -> Result<String> {
+        Ok(B64.encode(serde_json::to_vec(self)?))
+    }
+    pub fn parse(s: &str) -> Result<Self> {
+        ensure!(s.len() <= 1024, "invite too long");
+        let r: Self = serde_json::from_slice(&B64.decode(s)?)?;
+        ensure!(valid(&r.name, 64), "invalid room name");
+        Ok(r)
+    }
+}
+#[derive(Serialize, Deserialize)]
+pub struct Config {
+    pub name: String,
+    pub identity: [u8; 32],
+    pub rooms: Vec<Room>,
+    #[serde(skip)]
+    pub temporary: bool,
+    #[serde(skip)]
+    storage: Option<(PathBuf, Vec<u8>)>,
+}
+
+impl Config {
+    pub fn open(temporary: bool) -> Result<Self> {
+        if temporary {
+            return Ok(Self::fresh(true));
+        }
+        let dirs =
+            ProjectDirs::from("", "", "tiny-voice").context("no local configuration directory")?;
+        fs::create_dir_all(dirs.config_dir())?;
+        Self::open_at(dirs.config_dir().join("voice.json"))
+    }
+
+    fn fresh(temporary: bool) -> Self {
+        Self {
+            name: String::new(),
+            rooms: Vec::new(),
+            identity: random(),
+            temporary,
+            storage: None,
+        }
+    }
+
+    fn open_at(path: PathBuf) -> Result<Self> {
+        let _lock = lock(&path)?;
+        let (mut profile, bytes) = match fs::read(&path) {
+            Ok(bytes) => (serde_json::from_slice(&bytes)?, bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let profile = Self::fresh(false);
+                let bytes = serde_json::to_vec(&profile)?;
+                save(&path, &bytes)?;
+                (profile, bytes)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        profile.storage = Some((path, bytes));
+        Ok(profile)
+    }
+
+    pub fn persist(&mut self) -> Result<()> {
+        let Some((path, previous)) = &self.storage else {
+            return Ok(());
+        };
+        let _lock = lock(path)?;
+        ensure!(
+            fs::read(path)? == *previous,
+            "Profile changed on disk; restart voice before saving"
+        );
+        let bytes = serde_json::to_vec(self)?;
+        save(path, &bytes)?;
+        self.storage.as_mut().unwrap().1 = bytes;
+        Ok(())
+    }
+
+    pub fn add_room(&mut self, room: Room) -> Result<()> {
+        ensure!(
+            !self
+                .rooms
+                .iter()
+                .any(|saved| saved.secret == room.secret || saved.name == room.name),
+            "room or name already saved"
+        );
+        self.rooms.push(room);
+        if let Err(error) = self.persist() {
+            self.rooms.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn remove_room(&mut self, index: usize) -> Result<Room> {
+        ensure!(index < self.rooms.len(), "Session no longer saved");
+        let room = self.rooms.remove(index);
+        if let Err(error) = self.persist() {
+            self.rooms.insert(index, room);
+            return Err(error);
+        }
+        Ok(room)
+    }
+}
+
+fn lock(path: &Path) -> Result<fs::File> {
+    // The profile inode is replaced on save, so lock a stable sidecar instead.
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+fn save(dest: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = tempfile::NamedTempFile::new_in(dest.parent().unwrap())?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(dest)?;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_profiles_share_identity_and_reject_stale_edits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("voice.json");
+        let start = std::sync::Barrier::new(2);
+        let (first, stale) = std::thread::scope(|scope| {
+            let open = || {
+                start.wait();
+                Config::open_at(path.clone())
+            };
+            let other = scope.spawn(open);
+            (open(), other.join().unwrap())
+        });
+        let (mut first, mut stale) = (first?, stale?);
+        assert_eq!(first.identity, stale.identity);
+        first.add_room(Room {
+            name: "first".into(),
+            secret: [1; 32],
+        })?;
+        assert!(
+            stale
+                .add_room(Room {
+                    name: "stale".into(),
+                    secret: [2; 32]
+                })
+                .is_err()
+        );
+        assert!(stale.rooms.is_empty());
+        first.name = "updated".into();
+        first.persist()?;
+        let saved = Config::open_at(path)?;
+        assert_eq!(saved.identity, first.identity);
+        assert_eq!(saved.name, "updated");
+        assert_eq!(saved.rooms.len(), 1);
+        assert_eq!(saved.rooms[0].name, "first");
+        Ok(())
+    }
+}
