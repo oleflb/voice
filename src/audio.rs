@@ -14,8 +14,9 @@ use sonora::{
         TransparentModeType,
     },
 };
+use sonora_agc2::vad_wrapper::VoiceActivityDetectorWrapper;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -29,10 +30,51 @@ fn speaking(samples: &[f32]) -> bool {
     samples.iter().map(|x| x * x).sum::<f32>() > 0.0001 * samples.len() as f32
 }
 
+fn vad() -> VoiceActivityDetectorWrapper {
+    VoiceActivityDetectorWrapper::new(sonora_simd::detect_backend(), 48_000)
+}
+
 fn voice_encoder() -> Result<OpusEncoder> {
     let mut encoder = OpusEncoder::new(48_000, 1, Application::Voip)?;
     encoder.bitrate_bps = 24_000;
     Ok(encoder)
+}
+
+fn speech_probability(vad: &mut VoiceActivityDetectorWrapper, frame: &[f32; FRAME]) -> f32 {
+    // Sonora's WebRTC VAD expects 10 ms of float samples in 16-bit PCM units.
+    let [a, b] = frame.as_chunks::<BLOCK>().0 else {
+        unreachable!()
+    };
+    vad.analyze(&a.map(|x| x * 32768.0))
+        .max(vad.analyze(&b.map(|x| x * 32768.0)))
+}
+
+// A TOC-only 20 ms Opus DTX frame also parses as audio on older clients.
+const PAUSE: &[u8] = &[0xf8];
+const RESYNC_GAP: u64 = 8;
+const CONCEAL_FRAMES: u8 = 3;
+const TALK_THRESHOLD: f32 = 0.5;
+
+#[derive(Default)]
+struct SendGate {
+    tail: u8,
+    pending: VecDeque<(Instant, [f32; FRAME])>,
+}
+
+impl SendGate {
+    // Returns true once per talkspurt to mark the transition to silence.
+    fn queue(&mut self, at: Instant, frame: [f32; FRAME], talking: bool) -> bool {
+        self.pending.push_back((at, frame));
+        if talking {
+            self.tail = 11;
+        } else {
+            self.tail = self.tail.saturating_sub(1);
+        }
+        if self.tail == 0 && self.pending.len() > 5 {
+            self.pending.pop_front();
+        }
+        self.tail == 1
+    }
 }
 
 struct Playout {
@@ -44,6 +86,7 @@ struct Playout {
 pub struct Jitter {
     next: Option<u64>,
     missing: u8,
+    paused: bool,
 }
 
 impl Playout {
@@ -68,20 +111,33 @@ impl Jitter {
             packets.retain(|&sequence, _| sequence >= next);
         }
         let first = packets.keys().next().copied();
+        if self.paused {
+            if packets.len() < 2 {
+                return None;
+            }
+            self.next = first;
+            self.paused = false;
+        }
         let seq = match (self.next, first) {
-            (Some(next), Some(first)) if first.saturating_sub(next) >= 8 => first,
+            (Some(next), Some(first)) if first.saturating_sub(next) >= RESYNC_GAP => first,
             (Some(next), _) => next,
             (None, Some(first)) if packets.len() >= 2 => first,
             _ => return None,
         };
         let packet = packets.remove(&seq).unwrap_or_default();
+        if packet.as_ref() == PAUSE {
+            self.next = seq.checked_add(1);
+            self.missing = 0;
+            self.paused = true;
+            return None;
+        }
         // An empty Opus packet conceals one missing frame without restarting playout.
         self.missing = if packet.is_empty() {
             self.missing + 1
         } else {
             0
         };
-        if self.missing > 3 {
+        if self.missing > CONCEAL_FRAMES {
             self.next = None;
             return None;
         }
@@ -185,6 +241,8 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
     let mut have_first_half = false;
     let mut frame_started = Instant::now();
     let mut seq = 0u64;
+    let mut mic_vad = vad();
+    let mut gate = SendGate::default();
     device.device_start()?;
     call.state.lock().set_audio_available(true);
 
@@ -199,6 +257,8 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
         let state = call.state.lock();
         if state.peers.is_empty() {
             voices.clear();
+            gate.pending.clear();
+            gate.tail = 0;
             have_first_half = false;
             continue;
         }
@@ -293,31 +353,97 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
         }
         // Never send buffered samples from before an unmute.
         if state.muted || state.closed || frame_started < state.mic_changed_at {
+            gate.pending.clear();
+            gate.tail = 0;
             continue;
         }
-        if speaking(&mic_frame) {
-            state.last_speech = Some(Instant::now());
-        }
-        // Let incoming packets reach the jitter buffer while encoding the mic.
         drop(state);
-        let mut packet = [0; 1200];
-        packet[..8].copy_from_slice(&seq.to_be_bytes());
-        let size = encoder.encode(&mic_frame, FRAME, &mut packet[8..])?;
-        let bytes = Bytes::copy_from_slice(&packet[..8 + size]);
-        let state = call.state.lock();
-        if state.muted || state.closed || frame_started < state.mic_changed_at {
+        let talking = speech_probability(&mut mic_vad, &mic_frame) >= TALK_THRESHOLD;
+        let pause = gate.queue(frame_started, mic_frame, talking);
+        if gate.tail == 0 {
             continue;
         }
-        for peer in state.peers.values() {
-            let _ = peer.connection.send_datagram(bytes.clone());
+        for (at, frame) in gate.pending.drain(..) {
+            let mut packet = [0; 1200];
+            packet[..8].copy_from_slice(&seq.to_be_bytes());
+            let size = encoder.encode(&frame, FRAME, &mut packet[8..])?;
+            let bytes = Bytes::copy_from_slice(&packet[..8 + size]);
+            let mut state = call.state.lock();
+            if state.muted || state.closed || at < state.mic_changed_at {
+                continue;
+            }
+            if talking {
+                state.last_speech = Some(Instant::now());
+            }
+            state.send_audio(at, bytes);
+            seq += 1;
+            if pause {
+                packet[..8].copy_from_slice(&seq.to_be_bytes());
+                packet[8] = PAUSE[0];
+                let end = Bytes::copy_from_slice(&packet[..9]);
+                state.send_audio(at, end);
+                // Even if PAUSE is lost, concealed frames cannot consume the next talkspurt.
+                seq += RESYNC_GAP + u64::from(CONCEAL_FRAMES);
+            }
         }
-        seq += 1;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voice_gate_keeps_lead_in_and_releases_after_a_pause() {
+        let mut gate = SendGate::default();
+        let at = Instant::now();
+        for i in 0..20 {
+            assert!(!gate.queue(at, [i as f32; FRAME], false));
+            assert_eq!(gate.tail, 0);
+        }
+        assert!(!gate.queue(at, [20.0; FRAME], true));
+        assert_eq!(
+            gate.pending
+                .drain(..)
+                .map(|(_, f)| f[0])
+                .collect::<Vec<_>>(),
+            [15., 16., 17., 18., 19., 20.]
+        );
+        for i in 1..=10 {
+            assert_eq!(gate.queue(at, [0.; FRAME], false), i == 10);
+            assert_ne!(gate.tail, 0);
+            gate.pending.clear();
+        }
+        assert!(!gate.queue(at, [0.; FRAME], false));
+        assert_eq!(gate.tail, 0);
+    }
+
+    #[test]
+    fn intentional_pause_skips_concealment_and_rebuffers_on_resume() {
+        let audio = Bytes::from_static(b"audio");
+        let mut packets = BTreeMap::from([(0, audio.clone()), (1, Bytes::from_static(PAUSE))]);
+        let mut jitter = Jitter::default();
+        assert_eq!(jitter.packet(&mut packets), Some(audio.clone()));
+        assert_eq!(jitter.packet(&mut packets), None);
+        packets.insert(0, audio.clone()); // delayed duplicate from before the pause
+        packets.insert(2, audio.clone());
+        assert_eq!(jitter.packet(&mut packets), None);
+        packets.insert(3, audio.clone());
+        assert_eq!(jitter.packet(&mut packets), Some(audio));
+    }
+    #[test]
+    fn lost_pause_does_not_discard_first_resumed_frame() {
+        let first = Bytes::from_static(b"first word");
+        let mut jitter = Jitter {
+            next: Some(101),
+            ..Default::default()
+        };
+        let mut packets = BTreeMap::new();
+        for _ in 0..CONCEAL_FRAMES {
+            assert_eq!(jitter.packet(&mut packets), Some(Bytes::new()));
+        }
+        packets.insert(101 + RESYNC_GAP + u64::from(CONCEAL_FRAMES), first.clone());
+        assert_eq!(jitter.packet(&mut packets), Some(first));
+    }
     #[test]
     fn backend_periods_are_reblocked_without_losing_samples() -> Result<()> {
         use maudio::{

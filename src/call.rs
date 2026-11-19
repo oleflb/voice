@@ -32,6 +32,7 @@ pub enum Message {
 }
 
 pub struct Peer {
+    joined_at: Instant,
     pub last_heartbeat: Instant,
     pub name: String,
     pub muted: bool,
@@ -73,6 +74,11 @@ pub struct State {
 }
 
 impl State {
+    pub fn send_audio(&self, frame_started: Instant, bytes: Bytes) {
+        for peer in self.peers.values().filter(|p| p.joined_at <= frame_started) {
+            let _ = peer.connection.send_datagram(bytes.clone());
+        }
+    }
     fn current_peer(&mut self, id: &EndpointId, rank: &[u8; 32]) -> Result<&mut Peer> {
         self.peers
             .get_mut(id)
@@ -271,6 +277,7 @@ pub async fn connect(
         state.peers.insert(
             id,
             Peer {
+                joined_at: Instant::now(),
                 last_heartbeat: Instant::now(),
                 name,
                 muted,
@@ -487,6 +494,16 @@ mod tests {
             assert!(muted, "a chat-only caller must advertise its mic as off");
             assert!(matches!(receive(&mut reader).await?, Message::Mute(true)));
             assert_eq!(&connection.read_datagram().await?[..], b"h");
+            {
+                let state = caller.state.lock();
+                let joined = state.peers[&bob.id()].joined_at;
+                state.send_audio(
+                    joined - Duration::from_millis(20),
+                    Bytes::from_static(b"before"),
+                );
+                state.send_audio(joined, Bytes::from_static(b"after"));
+            }
+            assert_eq!(&connection.read_datagram().await?[..], b"after");
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(caller.state.lock().peers[&bob.id()].is_late());
             connection.closed().await;

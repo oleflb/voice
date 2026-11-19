@@ -4256,6 +4256,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sonora",
+ "sonora-agc2",
+ "sonora-simd",
  "tempfile",
  "tokio",
  "unicode-segmentation",
