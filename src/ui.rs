@@ -112,7 +112,10 @@ struct View {
     chat_input: TextEdit,
     chat_scroll: u16,
     room: usize,
-    peer: Option<iroh::EndpointId>,
+    selected: LevelRow,
+    level_rows: Vec<LevelRow>,
+    level_area: Rect,
+    level_offset: usize,
     draft: Option<TextEdit>,
     form: Option<Form>,
     notice: String,
@@ -126,6 +129,14 @@ struct PeerRow {
     local_mute: bool,
     volume: f32,
     last_speech: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LevelRow {
+    #[default]
+    Output,
+    Input,
+    Peer(iroh::EndpointId),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -174,8 +185,10 @@ fn indicator(muted: bool, speech: Option<Instant>) -> &'static str {
     }
 }
 
-fn adjust(volume: &mut f32, up: bool, max: f32) {
-    *volume = (*volume + if up { 0.1 } else { -0.1 }).clamp(0.0, max);
+fn adjust(volume: &mut f32, up: bool, max: f32) -> bool {
+    let old = *volume;
+    *volume = (((*volume * 10.0).round() + if up { 1.0 } else { -1.0 }) / 10.0).clamp(0.0, max);
+    old != *volume
 }
 
 fn panel(title: &str) -> Block<'static> {
@@ -189,6 +202,17 @@ fn panel(title: &str) -> Block<'static> {
 }
 
 impl View {
+    fn point_at_level(&mut self, column: u16, row: u16, click: bool) {
+        if self.level_area.contains((column, row).into()) {
+            let index = self.level_offset + usize::from(row - self.level_area.y);
+            if let Some(&level) = self.level_rows.get(index) {
+                self.selected = level;
+                if click {
+                    self.focus = Pane::People;
+                }
+            }
+        }
+    }
     fn move_focus(&mut self, forward: bool, lobby: &Lobby) {
         if self.form.is_some() || lobby.active.borrow().is_none() {
             return;
@@ -332,6 +356,7 @@ impl View {
     }
 
     fn draw_view(&mut self, frame: &mut ratatui::Frame, lobby: &Lobby) {
+        self.level_rows.clear();
         let [header, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
         let profile = if lobby.config.temporary {
@@ -434,63 +459,72 @@ impl View {
                 state.audio_available,
                 state.muted,
                 state.last_speech,
-                state.master,
-                state.gain,
+                state.levels.output,
+                state.levels.input,
                 peers,
                 state.chat.clone(),
             )
         };
         draw_rooms(frame, rooms, Some((&call, &peers)));
         {
-            let mut lines = vec![Line::from(format!(
-                "  {} (you) {}",
-                call.name,
-                if audio_available {
-                    indicator(muted, speech)
-                } else {
-                    "[chat-only]"
-                }
-            ))];
-            self.peer = self.peer.filter(|id| peers.iter().any(|p| p.id == *id));
-            let mut selected_row: usize = 0;
+            let mut lines = Vec::new();
+            if audio_available {
+                self.level_rows.extend([LevelRow::Output, LevelRow::Input]);
+                lines.push(Line::from(format!("Output {:.0}%", master * 100.0)));
+                lines.push(Line::from(format!("Input {:.0}%", gain * 100.0)));
+            }
             for peer in &peers {
-                let marker = if Some(peer.id) == self.peer {
-                    selected_row = lines.len();
-                    ">"
-                } else {
-                    " "
-                };
+                self.level_rows.push(LevelRow::Peer(peer.id));
                 let local = if peer.local_mute {
                     "[muted by you]"
                 } else {
                     ""
                 };
                 let row = Line::from(format!(
-                    "{marker} {} {} {local} {:.0}%",
+                    "{} {} {local} {:.0}%",
                     peer.name,
                     indicator(peer.muted, peer.last_speech),
                     peer.volume * 100.0
                 ));
                 lines.push(if peer.late { row.dim() } else { row });
             }
-            let title = if audio_available {
-                format!(
-                    "{} | output {:.0}% | input {:.0}%",
-                    call.room.name,
-                    master * 100.0,
-                    gain * 100.0
-                )
+            let status = if audio_available {
+                indicator(muted, speech)
             } else {
-                format!("{} | chat-only", call.room.name)
+                "[chat-only]"
             };
+            let block = self.pane(
+                Pane::People,
+                &format!("{} | {} (you) {status}", call.room.name, call.name),
+            );
+            self.level_area = block.inner(people);
+            let selected = self
+                .level_rows
+                .iter()
+                .position(|r| *r == self.selected)
+                .unwrap_or(0);
+            if let Some(row) = self.level_rows.get(selected) {
+                self.selected = *row;
+            }
+            for (i, line) in lines.iter_mut().enumerate() {
+                line.spans.insert(
+                    0,
+                    if i == selected {
+                        "› ".cyan()
+                    } else {
+                        "  ".into()
+                    },
+                );
+            }
+            let height = usize::from(self.level_area.height).max(1);
+            self.level_offset = self
+                .level_offset
+                .min(lines.len().saturating_sub(height))
+                .clamp(selected.saturating_sub(height - 1), selected);
             frame.render_widget(
                 Paragraph::new(lines)
-                    .scroll((
-                        selected_row.saturating_sub(people.height.saturating_sub(3) as usize)
-                            as u16,
-                        0,
-                    ))
-                    .block(self.pane(Pane::People, &title)),
+                    .scroll((self.level_offset as u16, 0))
+                    .block(block),
                 people,
             );
             let messages = messages
@@ -519,7 +553,7 @@ impl View {
                 "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nt chat · m mic mute · Esc leave · q quit"
             }
             Pane::People => {
-                "Alt+arrows/hjkl focus · arrows/hjkl select · x local mute · +/- peer volume\nm mic mute · [/] output · ,/. input · t chat · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · hover or arrows/hjkl select · +/- selected level\nx mute participant · m mic mute · t chat · Esc leave · q quit"
             }
         };
         let help = if self.focus == Pane::Chat && !self.chat_input.error.is_empty() {
@@ -568,7 +602,7 @@ impl View {
                     Ok(()) => {
                         self.room = self.room.min(lobby.config.rooms.len().saturating_sub(1));
                         if lobby.active.borrow().is_none() {
-                            self.peer = None;
+                            self.selected = LevelRow::Output;
                             self.chat_input = TextEdit::default();
                             self.chat_scroll = 0;
                         }
@@ -649,20 +683,13 @@ impl View {
         }
         if let Some(forward) = direction(key) {
             if self.focus == Pane::People {
-                if let Some(call) = active {
-                    let state = call.state.lock();
-                    let peers = &state.peers;
-                    let index = peers
-                        .keys()
-                        .position(|id| Some(*id) == self.peer)
-                        .map_or(0, |i| {
-                            if forward {
-                                (i + 1).min(peers.len() - 1)
-                            } else {
-                                i.saturating_sub(1)
-                            }
-                        });
-                    self.peer = peers.keys().nth(index).copied();
+                if let Some(i) = self.level_rows.iter().position(|r| *r == self.selected) {
+                    let next = if forward {
+                        (i + 1).min(self.level_rows.len() - 1)
+                    } else {
+                        i.saturating_sub(1)
+                    };
+                    self.selected = self.level_rows[next];
                 }
             } else if forward {
                 self.room = (self.room + 1).min(lobby.config.rooms.len().saturating_sub(1));
@@ -687,7 +714,7 @@ impl View {
             }
             KeyCode::Enter if self.focus == Pane::Sessions => {
                 if lobby.join(self.room)? {
-                    self.peer = None;
+                    self.selected = LevelRow::Output;
                     self.chat_input = TextEdit::default();
                     self.chat_scroll = 0;
                 }
@@ -707,17 +734,39 @@ impl View {
                         KeyCode::Char('t') => self.focus = Pane::Chat,
                         _ if !state.audio_available => {}
                         KeyCode::Char('m') => state.toggle_mute(),
-                        KeyCode::Char(ch @ ('[' | ']')) => {
-                            adjust(&mut state.master, ch == ']', 4.0)
+                        KeyCode::Char('x') if self.focus == Pane::People => {
+                            if let LevelRow::Peer(id) = self.selected
+                                && let Some(peer) = state.peers.get_mut(&id)
+                            {
+                                peer.local_mute = !peer.local_mute;
+                            }
                         }
-                        KeyCode::Char(ch @ (',' | '.')) => adjust(&mut state.gain, ch == '.', 4.0),
-                        KeyCode::Char(ch @ ('+' | '-' | 'x')) if self.focus == Pane::People => {
-                            if let Some(peer) = self.peer.and_then(|id| state.peers.get_mut(&id)) {
-                                if ch == 'x' {
-                                    peer.local_mute = !peer.local_mute;
-                                } else {
-                                    adjust(&mut peer.volume, ch == '+', 1.0);
+                        KeyCode::Char(ch @ ('+' | '-')) if self.focus == Pane::People => {
+                            let up = ch == '+';
+                            let changed = match self.selected {
+                                LevelRow::Output => adjust(&mut state.levels.output, up, 4.0),
+                                LevelRow::Input => adjust(&mut state.levels.input, up, 4.0),
+                                LevelRow::Peer(id) => {
+                                    let Some(peer) = state.peers.get_mut(&id) else {
+                                        return Ok(true);
+                                    };
+                                    if !adjust(&mut peer.volume, up, 1.0) {
+                                        return Ok(true);
+                                    }
+                                    let volume = peer.volume;
+                                    state.levels.peers.insert(id, volume);
+                                    true
                                 }
+                            };
+                            if !changed {
+                                return Ok(true);
+                            }
+                            lobby.config.levels = state.levels.clone();
+                            drop(state);
+                            if let Err(error) = lobby.config.persist() {
+                                call.state
+                                    .lock()
+                                    .log(format!("Could not save volume: {error}"));
                             }
                         }
                         _ => {}
@@ -737,12 +786,36 @@ pub fn run(lobby: &mut Lobby) -> Result<()> {
     }
     let result = (|| {
         crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste)?;
+        let mut mouse_enabled = false;
         loop {
             terminal.draw(|frame| view.draw(frame, lobby))?;
+            let capture = view.form.is_none() && !view.level_rows.is_empty();
+            if capture != mouse_enabled {
+                if capture {
+                    crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
+                } else {
+                    crossterm::execute!(std::io::stdout(), event::DisableMouseCapture)?;
+                }
+                mouse_enabled = capture;
+            }
             if !event::poll(Duration::from_millis(150))? {
                 continue;
             }
             match event::read()? {
+                Event::Mouse(mouse)
+                    if capture
+                        && matches!(
+                            mouse.kind,
+                            event::MouseEventKind::Moved
+                                | event::MouseEventKind::Down(event::MouseButton::Left)
+                        ) =>
+                {
+                    view.point_at_level(
+                        mouse.column,
+                        mouse.row,
+                        mouse.kind != event::MouseEventKind::Moved,
+                    );
+                }
                 Event::Paste(text) => {
                     let text = text.trim_end_matches(['\r', '\n']);
                     let input = if view.form.is_none() && view.focus == Pane::Chat {
@@ -764,7 +837,11 @@ pub fn run(lobby: &mut Lobby) -> Result<()> {
         }
         Ok(())
     })();
-    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        event::DisableMouseCapture,
+        event::DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -808,6 +885,17 @@ mod tests {
             Default::default(),
         );
         assert_ne!(first.config.identity, second.config.identity);
+        let mut view = View {
+            focus: Pane::Chat,
+            level_area: Rect::new(1, 1, 10, 1),
+            level_rows: vec![LevelRow::Input],
+            ..Default::default()
+        };
+        view.point_at_level(1, 1, false);
+        view.key(KeyCode::Char('m'), &mut first)?;
+        assert_eq!(view.chat_input.text, "m");
+        view.point_at_level(1, 1, true);
+        assert!(view.focus == Pane::People);
         let mut view = View::default();
         view.edit(Form::Name);
         view.draft.as_mut().unwrap().insert(&"é".repeat(33));

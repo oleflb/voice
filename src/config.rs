@@ -46,11 +46,35 @@ impl Room {
         Ok(r)
     }
 }
+pub const DEFAULT_PEER_VOLUME: f32 = 0.5;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Levels {
+    pub output: f32,
+    pub input: f32,
+    pub peers: std::collections::BTreeMap<iroh::EndpointId, f32>,
+    #[serde(default)]
+    peak_relative: bool,
+}
+
+impl Default for Levels {
+    fn default() -> Self {
+        Self {
+            output: 1.0,
+            input: 1.0,
+            peers: Default::default(),
+            peak_relative: true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     pub name: String,
     pub identity: [u8; 32],
     pub rooms: Vec<Room>,
+    #[serde(default)]
+    pub levels: Levels,
     #[serde(skip)]
     pub temporary: bool,
     #[serde(skip)]
@@ -72,6 +96,7 @@ impl Config {
         Self {
             name: String::new(),
             rooms: Vec::new(),
+            levels: Levels::default(),
             identity: random(),
             temporary,
             storage: None,
@@ -90,6 +115,15 @@ impl Config {
             }
             Err(e) => return Err(e.into()),
         };
+        profile.levels.input = profile.levels.input.clamp(0., 4.);
+        profile.levels.output = profile.levels.output.clamp(0., 4.);
+        for volume in profile.levels.peers.values_mut() {
+            if !profile.levels.peak_relative {
+                *volume *= DEFAULT_PEER_VOLUME;
+            }
+            *volume = volume.clamp(0.0, 1.0);
+        }
+        profile.levels.peak_relative = true;
         profile.storage = Some((path, bytes));
         Ok(profile)
     }
@@ -155,11 +189,57 @@ fn save(dest: &Path, bytes: &[u8]) -> Result<()> {
     tmp.persist(dest)?;
     Ok(())
 }
-pub const DEFAULT_PEER_VOLUME: f32 = 0.5;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_peer_gain_moves_to_balanced_midpoint_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("voice.json");
+        let id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let mut profile = Config::fresh(false);
+        profile.levels.peers.insert(id, 1.0);
+        profile.levels.input = 12.;
+        profile.levels.output = -4.;
+        let mut old = serde_json::to_value(profile)?;
+        old["levels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("peak_relative");
+        fs::write(&path, serde_json::to_vec(&old)?)?;
+        let mut config = Config::open_at(path.clone())?;
+        assert_eq!(config.levels.peers[&id], DEFAULT_PEER_VOLUME);
+        assert_eq!((config.levels.input, config.levels.output), (4., 0.));
+        config.persist()?;
+        assert_eq!(
+            Config::open_at(path)?.levels.peers[&id],
+            DEFAULT_PEER_VOLUME
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn old_profile_remembers_levels_after_upgrade() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("voice.json");
+        let mut old = serde_json::to_value(Config::fresh(false))?;
+        old.as_object_mut().unwrap().remove("levels");
+        fs::write(&path, serde_json::to_vec(&old)?)?;
+        let mut config = Config::open_at(path.clone())?;
+        assert_eq!((config.levels.output, config.levels.input), (1.0, 1.0));
+        let id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        config.levels.output = 4.0;
+        config.levels.input = 1.2;
+        config.levels.peers.insert(id, 0.75);
+        config.persist()?;
+        let saved = Config::open_at(path)?.levels;
+        assert_eq!(
+            (saved.output, saved.input, saved.peers[&id]),
+            (4.0, 1.2, 0.75)
+        );
+        Ok(())
+    }
 
     #[test]
     fn concurrent_profiles_share_identity_and_reject_stale_edits() -> Result<()> {

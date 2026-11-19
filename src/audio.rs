@@ -343,7 +343,7 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
             have_first_half = false;
             continue;
         }
-        let input = state.gain;
+        let input = state.levels.input;
         drop(state);
         if options.sender_agc && input.max(1.) != boost {
             boost = input.max(1.);
@@ -370,7 +370,7 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
         if have_first_half {
             continue;
         }
-        let master = state.master;
+        let master = state.levels.output;
         voices.retain(|id, voice| {
             state.peers.get(id).is_some_and(|p| {
                 voice
@@ -416,7 +416,7 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
         limit_mix(&mut mix, master, &mut limiter_gain);
         // Discard a stale mix rather than queue audio after a mute or reconnect.
         let mut state = call.state.lock();
-        let mut current = !state.closed && master == state.master;
+        let mut current = !state.closed && master == state.levels.output;
         for input in &inputs {
             let Some(peer) = state
                 .peers

@@ -65,8 +65,7 @@ pub struct State {
     pub audio_available: bool,
     pub muted: bool,
     pub mic_changed_at: Instant,
-    pub master: f32,
-    pub gain: f32,
+    pub levels: crate::config::Levels,
     pub last_speech: Option<Instant>,
     pub peers: BTreeMap<EndpointId, Peer>,
     dialing: BTreeSet<EndpointId>,
@@ -134,8 +133,7 @@ impl Call {
                 audio_available: false,
                 muted: false,
                 mic_changed_at: Instant::now(),
-                master: 1.0,
-                gain: 1.0,
+                levels: Default::default(),
                 last_speech: None,
                 peers: BTreeMap::new(),
                 dialing: BTreeSet::new(),
@@ -271,7 +269,15 @@ pub async fn connect(
                 state.dialing.contains(&id) || state.peers.len() + state.dialing.len() < MAX_PEERS,
                 "room full"
             );
-            (false, crate::config::DEFAULT_PEER_VOLUME)
+            (
+                false,
+                state
+                    .levels
+                    .peers
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(crate::config::DEFAULT_PEER_VOLUME),
+            )
         };
         control.try_send(Message::Mute(state.mic_off()))?;
         state.peers.insert(

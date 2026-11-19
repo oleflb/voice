@@ -176,6 +176,7 @@ impl Lobby {
             return Ok(false);
         }
         let call = Call::new(room.clone(), self.config.name.clone());
+        call.state.lock().levels = self.config.levels.clone();
         self.leave();
         let audio_call = call.clone();
         let capture = self.capture;
