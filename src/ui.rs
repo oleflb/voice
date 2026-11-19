@@ -795,8 +795,16 @@ mod tests {
             .relay_mode(RelayMode::Disabled)
             .bind()
             .await?;
-        let mut first = Lobby::start(endpoint.clone(), config::Config::open(true)?, false);
-        let mut second = Lobby::start(endpoint.clone(), config::Config::open(true)?, false);
+        let mut first = Lobby::start(
+            endpoint.clone(),
+            config::Config::open(true)?,
+            Default::default(),
+        );
+        let mut second = Lobby::start(
+            endpoint.clone(),
+            config::Config::open(true)?,
+            Default::default(),
+        );
         assert_ne!(first.config.identity, second.config.identity);
         let mut view = View::default();
         view.edit(Form::Name);

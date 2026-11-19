@@ -10,7 +10,7 @@ use config::{Config, Room};
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use std::io::{self, Write};
 
-const HELP: &str = "voice                       Open the lobby\nvoice create NAME           Save a new room and print its secret invite\nvoice import                Paste and save a room invite\nvoice invite NAME           Print a saved room's invite\nvoice --echo-cancellation   Enable software echo cancellation for speaker use";
+const HELP: &str = "voice                         Open the lobby with echo cancellation and adaptive mic gain\nvoice create NAME             Save a new room and print its secret invite\nvoice import                  Paste and save a room invite\nvoice invite NAME             Print a saved room's invite\nvoice --no-echo-cancellation  Disable software echo cancellation\nvoice --no-sender-agc         Disable adaptive mic gain\n--temporary-identity          Fresh in-memory profile; no config reads or writes";
 
 fn prompt(label: &str) -> Result<String> {
     eprint!("{label}: ");
@@ -30,7 +30,7 @@ async fn endpoint(identity: [u8; 32], protocol: &[u8]) -> Result<Endpoint> {
 
 enum Command<'a> {
     Help,
-    Lobby { echo_cancellation: bool },
+    Lobby(audio::CaptureOptions),
     Create(&'a str),
     Import,
     Invite(&'a str),
@@ -39,17 +39,23 @@ enum Command<'a> {
 fn parse<'a>(args: &[&'a str]) -> Result<Command<'a>> {
     Ok(match args {
         ["--help" | "-h"] => Command::Help,
-        [] | ["--system-aec"] => Command::Lobby {
-            echo_cancellation: false,
-        },
-        ["--echo-cancellation"] => Command::Lobby {
-            echo_cancellation: true,
-        },
         ["create" | "invite", name] if !config::valid(name, 64) => bail!("invalid room name"),
         ["create", name] => Command::Create(name),
         ["import"] => Command::Import,
         ["invite", name] => Command::Invite(name),
-        _ => bail!("{HELP}"),
+        flags => {
+            let mut capture = audio::CaptureOptions::default();
+            for flag in flags {
+                match *flag {
+                    "--no-sender-agc" => capture.sender_agc = false,
+                    "--sender-agc" => capture.sender_agc = true,
+                    "--no-echo-cancellation" | "--system-aec" => capture.echo_cancellation = false,
+                    "--echo-cancellation" => capture.echo_cancellation = true,
+                    _ => bail!("{HELP}"),
+                }
+            }
+            Command::Lobby(capture)
+        }
     })
 }
 
@@ -64,15 +70,13 @@ async fn main() -> Result<()> {
         .collect();
     match parse(&args)? {
         Command::Help => {
-            println!(
-                "{HELP}\n--temporary-identity        Fresh in-memory profile; no config reads or writes"
-            );
+            println!("{HELP}");
             Ok(())
         }
-        Command::Lobby { echo_cancellation } => {
+        Command::Lobby(capture) => {
             let config = Config::open(temporary)?;
             let endpoint = endpoint(config.identity, call::ALPN).await?;
-            let mut lobby = lobby::Lobby::start(endpoint.clone(), config, echo_cancellation);
+            let mut lobby = lobby::Lobby::start(endpoint.clone(), config, capture);
             let result = ui::run(&mut lobby);
             lobby.shutdown().await;
             endpoint.close().await;
@@ -101,6 +105,25 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[test]
+fn lobby_capture_defaults_and_overrides() -> Result<()> {
+    for (flags, expected) in [
+        (&[][..], (true, true)),
+        (&["--no-sender-agc"], (true, false)),
+        (&["--system-aec", "--sender-agc"], (false, true)),
+        (
+            &["--no-sender-agc", "--no-echo-cancellation"],
+            (false, false),
+        ),
+    ] {
+        let Command::Lobby(options) = parse(flags)? else {
+            panic!("expected lobby")
+        };
+        assert_eq!((options.echo_cancellation, options.sender_agc), expected);
+    }
+    Ok(())
 }
 
 #[test]

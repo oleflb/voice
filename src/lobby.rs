@@ -22,7 +22,7 @@ pub struct Lobby {
     pub config: Config,
     pub rosters: Vec<watch::Receiver<Option<Vec<String>>>>,
     pub active: watch::Sender<Option<Arc<Call>>>,
-    echo_cancellation: bool,
+    capture: audio::CaptureOptions,
     audio_thread: Option<std::thread::JoinHandle<()>>,
     endpoint: Endpoint,
     discovery: Arc<tokio::sync::OnceCell<Client>>,
@@ -30,14 +30,14 @@ pub struct Lobby {
 }
 
 impl Lobby {
-    pub fn start(endpoint: Endpoint, config: Config, echo_cancellation: bool) -> Self {
+    pub fn start(endpoint: Endpoint, config: Config, capture: audio::CaptureOptions) -> Self {
         let (active, receiver) = watch::channel::<Option<Arc<Call>>>(None);
         tokio::spawn(accept_calls(endpoint.clone(), receiver));
         let mut lobby = Self {
             config,
             rosters: Vec::new(),
             active,
-            echo_cancellation,
+            capture,
             audio_thread: None,
             endpoint,
             discovery: Arc::default(),
@@ -178,12 +178,12 @@ impl Lobby {
         let call = Call::new(room.clone(), self.config.name.clone());
         self.leave();
         let audio_call = call.clone();
-        let echo_cancellation = self.echo_cancellation;
+        let capture = self.capture;
         let thread = std::thread::Builder::new()
             .name("voice-audio".into())
             .stack_size(8 << 20)
             .spawn(move || {
-                if let Err(error) = audio::run(&audio_call, echo_cancellation) {
+                if let Err(error) = audio::run(&audio_call, capture) {
                     let mut state = audio_call.state.lock();
                     state.set_audio_available(false);
                     state.log(format!(

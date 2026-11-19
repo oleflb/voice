@@ -7,7 +7,13 @@ use maudio::{
     device::device_builder::{DeviceBuilder, DeviceBuilderOps, DuplexDeviceBuilder},
 };
 use rusty_opus::{Application, OpusDecoder, OpusEncoder};
-use sonora::{AudioProcessing, Config, StreamConfig, config::EchoCanceller};
+use sonora::{
+    AudioProcessing, Config, StreamConfig,
+    config::{
+        EchoCanceller, GainController2, NoiseSuppression, NoiseSuppressionLevel,
+        TransparentModeType,
+    },
+};
 use std::{
     collections::BTreeMap,
     sync::Arc,
@@ -21,6 +27,12 @@ type Block = [f32; BLOCK];
 
 fn speaking(samples: &[f32]) -> bool {
     samples.iter().map(|x| x * x).sum::<f32>() > 0.0001 * samples.len() as f32
+}
+
+fn voice_encoder() -> Result<OpusEncoder> {
+    let mut encoder = OpusEncoder::new(48_000, 1, Application::Voip)?;
+    encoder.bitrate_bps = 24_000;
+    Ok(encoder)
 }
 
 struct Playout {
@@ -109,7 +121,45 @@ fn duplex_device() -> DuplexDeviceBuilder<f32, f32> {
     device
 }
 
-pub fn run(call: &Call, echo_cancellation: bool) -> Result<()> {
+fn capture_processor(echo_cancellation: bool, adaptive_gain: bool) -> AudioProcessing {
+    let format = StreamConfig::new(48_000, 1);
+    AudioProcessing::builder()
+        .capture_config(format)
+        .render_config(format)
+        .config(Config {
+            echo_canceller: echo_cancellation.then(|| EchoCanceller {
+                transparent_mode: TransparentModeType::Hmm,
+                ..Default::default()
+            }),
+            noise_suppression: Some(NoiseSuppression {
+                level: NoiseSuppressionLevel::Low,
+                ..Default::default()
+            }),
+            gain_controller2: adaptive_gain.then(|| GainController2 {
+                adaptive_digital: Some(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .build()
+}
+
+#[derive(Clone, Copy)]
+pub struct CaptureOptions {
+    pub echo_cancellation: bool,
+    pub sender_agc: bool,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            echo_cancellation: true,
+            sender_agc: true,
+        }
+    }
+}
+
+pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
     let capture = Arc::new(ArrayQueue::new(4));
     let playback = Arc::new(ArrayQueue::<Block>::new(4));
     let (input_queue, output_queue) = (capture.clone(), playback.clone());
@@ -126,19 +176,9 @@ pub fn run(call: &Call, echo_cancellation: bool) -> Result<()> {
         input_queue.force_push((Instant::now(), *mic, *render));
         worker.unpark();
     })?;
-    let mut encoder = OpusEncoder::new(48_000, 1, Application::Voip)?;
-    encoder.bitrate_bps = 24_000;
-    let mut echo = echo_cancellation.then(|| {
-        let format = StreamConfig::new(48_000, 1);
-        AudioProcessing::builder()
-            .capture_config(format)
-            .render_config(format)
-            .config(Config {
-                echo_canceller: Some(EchoCanceller::default()),
-                ..Config::default()
-            })
-            .build()
-    });
+    let mut encoder = voice_encoder()?;
+    let mut processor = capture_processor(options.echo_cancellation, options.sender_agc);
+    let mut boost = 1.0;
     let mut voices = BTreeMap::<_, Playout>::new();
     let mut inputs = Vec::new();
     let mut mic_frame = [0.0; FRAME];
@@ -156,16 +196,23 @@ pub fn run(call: &Call, echo_cancellation: bool) -> Result<()> {
             thread::park_timeout(Duration::from_millis(50));
             continue;
         };
-        if call.state.lock().peers.is_empty() {
+        let state = call.state.lock();
+        if state.peers.is_empty() {
             voices.clear();
             have_first_half = false;
             continue;
         }
-        let mut clean = mic;
-        if let Some(aec) = &mut echo {
-            aec.process_render_f32(&[&render], &mut [&mut [0.0; BLOCK]])?;
-            aec.process_capture_f32(&[&mic], &mut [&mut clean])?;
+        let input = state.gain;
+        drop(state);
+        if options.sender_agc && input.max(1.) != boost {
+            boost = input.max(1.);
+            processor.set_capture_fixed_post_gain(20. * boost.log10());
         }
+        let mut clean = mic;
+        if options.echo_cancellation {
+            processor.process_render_f32(&[&render], &mut [&mut [0.0; BLOCK]])?;
+        }
+        processor.process_capture_f32(&[&mic], &mut [&mut clean])?;
         let mut state = call.state.lock();
         if !have_first_half {
             frame_started = captured_at - Duration::from_millis(10);
@@ -175,7 +222,7 @@ pub fn run(call: &Call, echo_cancellation: bool) -> Result<()> {
             *dest = if state.muted {
                 0.0
             } else {
-                (sample * state.gain).clamp(-1.0, 1.0)
+                (sample * (input / boost)).clamp(-1., 1.)
             };
         }
         have_first_half = !have_first_half;
