@@ -174,8 +174,8 @@ fn indicator(muted: bool, speech: Option<Instant>) -> &'static str {
     }
 }
 
-fn adjust(volume: &mut f32, up: bool) {
-    *volume = (*volume + if up { 0.1 } else { -0.1 }).clamp(0.0, 4.0);
+fn adjust(volume: &mut f32, up: bool, max: f32) {
+    *volume = (*volume + if up { 0.1 } else { -0.1 }).clamp(0.0, max);
 }
 
 fn panel(title: &str) -> Block<'static> {
@@ -707,14 +707,16 @@ impl View {
                         KeyCode::Char('t') => self.focus = Pane::Chat,
                         _ if !state.audio_available => {}
                         KeyCode::Char('m') => state.toggle_mute(),
-                        KeyCode::Char(ch @ ('[' | ']')) => adjust(&mut state.master, ch == ']'),
-                        KeyCode::Char(ch @ (',' | '.')) => adjust(&mut state.gain, ch == '.'),
+                        KeyCode::Char(ch @ ('[' | ']')) => {
+                            adjust(&mut state.master, ch == ']', 4.0)
+                        }
+                        KeyCode::Char(ch @ (',' | '.')) => adjust(&mut state.gain, ch == '.', 4.0),
                         KeyCode::Char(ch @ ('+' | '-' | 'x')) if self.focus == Pane::People => {
                             if let Some(peer) = self.peer.and_then(|id| state.peers.get_mut(&id)) {
                                 if ch == 'x' {
                                     peer.local_mute = !peer.local_mute;
                                 } else {
-                                    adjust(&mut peer.volume, ch == '+');
+                                    adjust(&mut peer.volume, ch == '+', 1.0);
                                 }
                             }
                         }

@@ -155,6 +155,8 @@ fn save(dest: &Path, bytes: &[u8]) -> Result<()> {
     tmp.persist(dest)?;
     Ok(())
 }
+pub const DEFAULT_PEER_VOLUME: f32 = 0.5;
+
 #[cfg(test)]
 mod tests {
     use super::*;

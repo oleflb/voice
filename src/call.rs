@@ -271,7 +271,7 @@ pub async fn connect(
                 state.dialing.contains(&id) || state.peers.len() + state.dialing.len() < MAX_PEERS,
                 "room full"
             );
-            (false, 1.0)
+            (false, crate::config::DEFAULT_PEER_VOLUME)
         };
         control.try_send(Message::Mute(state.mic_off()))?;
         state.peers.insert(
