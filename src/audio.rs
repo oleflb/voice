@@ -581,6 +581,157 @@ mod tests {
         assert_eq!(jitter.packet(&mut packets), Some(first));
     }
     #[test]
+    #[ignore = "offline loudness calibration: VOICE_CALIBRATION points to mono 48 kHz f32le inputs"]
+    fn render_calibration_passages() -> Result<()> {
+        let mode = std::env::var("VOICE_PIPELINE").unwrap_or_else(|_| "combined".into());
+        anyhow::ensure!(matches!(mode.as_str(), "baseline" | "sender" | "combined"));
+        for entry in std::fs::read_dir(std::env::var("VOICE_CALIBRATION")?)? {
+            let path = entry?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("pcm") {
+                continue;
+            }
+            let mut encoder = voice_encoder()?;
+            let mut voice = Playout::new()?;
+            let mut limiter = 1.;
+            let mut output = Vec::new();
+            let mut capture = capture_processor(false, mode != "baseline");
+            for frame in std::fs::read(&path)?.as_chunks::<{ FRAME * 4 }>().0 {
+                let samples = frame
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes)
+                    .collect::<Vec<_>>();
+                let mut clean = [0.; FRAME];
+                for (src, dst) in samples
+                    .as_chunks::<BLOCK>()
+                    .0
+                    .iter()
+                    .zip(clean.as_chunks_mut::<BLOCK>().0)
+                {
+                    capture.process_capture_f32(&[src], &mut [dst])?;
+                }
+                let mut packet = [0; 1192];
+                let n = encoder.encode(&clean, FRAME, &mut packet)?;
+                let mut decoded = voice.decode(&Bytes::copy_from_slice(&packet[..n])).unwrap();
+                let p = speech_probability(&mut voice.vad, &decoded);
+                if mode != "sender" {
+                    voice.level(&mut decoded, p, crate::config::DEFAULT_PEER_VOLUME);
+                }
+                limit_mix(&mut decoded, 1., &mut limiter);
+                output.extend(decoded.into_iter().flat_map(f32::to_le_bytes));
+            }
+            std::fs::write(path.with_extension(&mode), output)?;
+        }
+        Ok(())
+    }
+
+    fn phrase(scale: f32) -> impl Iterator<Item = [f32; FRAME]> {
+        // eSpeak NG: “Can you hear me clearly?”, mono 16 kHz signed LE PCM.
+        let pcm = include_bytes!("../tests/fixtures/first-phrase.s16le");
+        pcm.as_chunks::<{ FRAME / 3 * 2 }>()
+            .0
+            .iter()
+            .map(move |bytes| {
+                std::array::from_fn(|i| {
+                    let i = i / 3 * 2;
+                    (f32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]])) * scale / 32768.)
+                        .clamp(-1., 1.)
+                })
+            })
+    }
+
+    #[test]
+    fn first_phrase_after_a_loud_sound_recovers_without_rejoining() -> Result<()> {
+        for agc in [false, true] {
+            let mut capture = capture_processor(false, agc);
+            let mut encoder = voice_encoder()?;
+            let mut voice = Playout::new()?;
+            let mut limiter = 1.;
+            let mut energy = [[0.; 2]; 3];
+            for (pass, scale) in [0.06, 1.2, 0.06].into_iter().enumerate() {
+                for raw in phrase(scale) {
+                    let mut clean = [0.; FRAME];
+                    for (src, dst) in raw
+                        .as_chunks::<BLOCK>()
+                        .0
+                        .iter()
+                        .zip(clean.as_chunks_mut::<BLOCK>().0)
+                    {
+                        capture.process_capture_f32(&[src], &mut [dst])?;
+                    }
+                    let mut packet = [0; 1192];
+                    let n = encoder.encode(&clean, FRAME, &mut packet)?;
+                    let mut decoded = voice.decode(&Bytes::copy_from_slice(&packet[..n])).unwrap();
+                    energy[pass][0] += decoded.iter().map(|x| x * x).sum::<f32>();
+                    let p = speech_probability(&mut voice.vad, &decoded);
+                    voice.level(&mut decoded, p, crate::config::DEFAULT_PEER_VOLUME);
+                    limit_mix(&mut decoded, 1., &mut limiter);
+                    energy[pass][1] += decoded.iter().map(|x| x * x).sum::<f32>();
+                }
+            }
+            let delta = |i: usize| 10. * (energy[2][i] / energy[0][i]).log10();
+            eprintln!(
+                "agc={agc}, decoded {:.1} dB, playback {:.1} dB",
+                delta(0),
+                delta(1)
+            );
+            assert!(delta(1).abs() <= 3.);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quiet_first_phrase_is_leveled_after_opus_at_both_slider_positions() -> Result<()> {
+        let mut encoder = voice_encoder()?;
+        let mut detector = vad();
+        let mut gate = SendGate::default();
+        let began = Instant::now();
+        let mut first_sent = None;
+        let mut listeners = [Playout::new()?, Playout::new()?];
+        let mut limiters = [1.; 2];
+        let mut energy = [0.; 3];
+        for (i, frame) in phrase(0.08).take(40).enumerate() {
+            let at = began + Duration::from_millis(i as u64 * 20);
+            let talking = speech_probability(&mut detector, &frame) >= TALK_THRESHOLD;
+            gate.queue(at, frame, talking);
+            if gate.tail == 0 {
+                continue;
+            }
+            for (at, frame) in gate.pending.drain(..) {
+                first_sent.get_or_insert(at);
+                let mut packet = [0; 1192];
+                let n = encoder.encode(&frame, FRAME, &mut packet)?;
+                let packet = Bytes::copy_from_slice(&packet[..n]);
+                for (i, listener) in listeners.iter_mut().enumerate() {
+                    let mut decoded = listener.decode(&packet).unwrap();
+                    if i == 0 {
+                        energy[0] += decoded.iter().map(|x| x * x).sum::<f32>();
+                    }
+                    let p = speech_probability(&mut listener.vad, &decoded);
+                    listener.level(&mut decoded, p, [0.5, 1.0][i]);
+                    limit_mix(&mut decoded, 1., &mut limiters[i]);
+                    assert!(peak(&decoded) <= 1.000001);
+                    energy[i + 1] += decoded.iter().map(|x| x * x).sum::<f32>();
+                }
+            }
+        }
+        assert_eq!(
+            first_sent,
+            Some(began),
+            "gate lost the onset of the quiet phrase"
+        );
+        let auto_db = 10. * (energy[1] / energy[0]).log10();
+        let slider_db = 10. * (energy[2] / energy[1]).log10();
+        assert!(
+            auto_db > 9. && slider_db > 4.,
+            "auto: {auto_db:.1} dB, slider: {slider_db:.1} dB"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn quiet_and_loud_peers_converge_without_boosting_pauses() -> Result<()> {
         for amplitude in [0.03, 0.4] {
             let mut voice = Playout::new()?;
