@@ -84,6 +84,8 @@ struct Playout {
     speech_frames: u8,
     speech_peak: f32,
     quiet_frames: u8,
+    applied_gain: f32,
+    last_volume: Option<f32>,
     vad: VoiceActivityDetectorWrapper,
     stream: Option<Arc<()>>,
 }
@@ -104,6 +106,8 @@ impl Playout {
             speech_frames: 0,
             speech_peak: 0.0,
             quiet_frames: 0,
+            applied_gain: 1.,
+            last_volume: None,
             vad: vad(),
             stream: None,
         })
@@ -136,7 +140,12 @@ impl Playout {
     }
 
     fn level(&mut self, samples: &mut [f32; FRAME], probability: f32, volume: f32) {
-        let start = self.playback_gain(volume);
+        let start = if self.last_volume.replace(volume) == Some(volume) {
+            self.applied_gain
+        } else {
+            self.playback_gain(volume)
+        };
+        let first_speech = self.speech_frames == 0;
         let frame_peak = peak(samples);
         let mut max_gain = 1.0 / frame_peak.max(f32::MIN_POSITIVE);
         if probability >= TALK_THRESHOLD {
@@ -145,7 +154,7 @@ impl Playout {
                 // Reacquire after sustained quieter speech, not during silence or a single soft syllable.
                 if power < self.speech_power * 0.25 && frame_peak < self.speech_peak * 0.5 {
                     self.quiet_frames += 1;
-                    if self.quiet_frames == 8 {
+                    if self.quiet_frames == 50 {
                         self.speech_frames = 0;
                         self.speech_peak = frame_peak;
                         self.quiet_frames = 0;
@@ -154,16 +163,30 @@ impl Playout {
                     self.quiet_frames = 0;
                 }
                 // Start with measured speech; reach a two-second time constant as it accumulates.
-                self.speech_frames = (self.speech_frames + 1).min(100);
-                self.speech_power += (power - self.speech_power) / f32::from(self.speech_frames);
-                self.speech_peak = frame_peak.max(self.speech_peak * 0.995);
+                if self.quiet_frames == 0 {
+                    self.speech_frames = (self.speech_frames + 1).min(100);
+                    self.speech_power +=
+                        (power - self.speech_power) / f32::from(self.speech_frames);
+                    self.speech_peak = frame_peak.max(self.speech_peak * 0.995);
+                }
             }
         } else if self.speech_frames > 0 && frame_peak > 2.0 * self.speech_peak {
             // Don't boost an isolated click already louder than this caller's speech.
             max_gain = max_gain.min(1.0);
         }
+        let target = self.playback_gain(volume);
+        let end = if first_speech {
+            target
+        } else if probability >= TALK_THRESHOLD {
+            // Per 20 ms of speech: rise at 2 dB/s, fall at 6 dB/s.
+            target.clamp(start * 0.9862795, start * 1.0046158)
+        } else {
+            start
+        };
+        // A single click should not turn down the caller for the next several seconds.
+        self.applied_gain = end;
         let start = start.min(max_gain);
-        let end = self.playback_gain(volume).min(max_gain);
+        let end = end.min(max_gain);
         for (i, x) in samples.iter_mut().enumerate() {
             *x *= start + (end - start) * ((i + 1) as f32 / FRAME as f32);
         }
@@ -498,6 +521,23 @@ mod tests {
     }
 
     #[test]
+    fn soft_syllables_hold_their_level_before_a_gradual_boost() -> Result<()> {
+        let mut voice = Playout::new()?;
+        voice.level(&mut [0.2; FRAME], 1., 0.5);
+        let initial = voice.applied_gain;
+        for _ in 0..49 {
+            voice.level(&mut [0.02; FRAME], 1., 0.5);
+            voice.level(&mut [0.; FRAME], 0., 0.5);
+            assert_eq!(voice.applied_gain, initial);
+        }
+        for _ in 0..50 {
+            voice.level(&mut [0.02; FRAME], 1., 0.5);
+        }
+        assert!((20. * (voice.applied_gain / initial).log10() - 2.).abs() < 0.01);
+        Ok(())
+    }
+
+    #[test]
     fn peak_recovers_after_shout_but_not_during_silence() -> Result<()> {
         let mut voice = Playout::new()?;
         voice.level(&mut [0.1; FRAME], 1., 1.);
@@ -643,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn first_phrase_after_a_loud_sound_recovers_without_rejoining() -> Result<()> {
+    fn sustained_quiet_speech_recovers_after_a_loud_sound() -> Result<()> {
         for agc in [false, true] {
             let mut capture = capture_processor(false, agc);
             let mut encoder = voice_encoder()?;
@@ -651,7 +691,8 @@ mod tests {
             let mut limiter = 1.;
             let mut energy = [[0.; 2]; 3];
             for (pass, scale) in [0.06, 1.2, 0.06].into_iter().enumerate() {
-                for raw in phrase(scale) {
+                let repeats = if pass == 1 { 1 } else { 20 };
+                for (repeat, raw) in (0..repeats).flat_map(|r| phrase(scale).map(move |f| (r, f))) {
                     let mut clean = [0.; FRAME];
                     for (src, dst) in raw
                         .as_chunks::<BLOCK>()
@@ -664,11 +705,15 @@ mod tests {
                     let mut packet = [0; 1192];
                     let n = encoder.encode(&clean, FRAME, &mut packet)?;
                     let mut decoded = voice.decode(&Bytes::copy_from_slice(&packet[..n])).unwrap();
-                    energy[pass][0] += decoded.iter().map(|x| x * x).sum::<f32>();
+                    if repeat + 1 == repeats {
+                        energy[pass][0] += decoded.iter().map(|x| x * x).sum::<f32>();
+                    }
                     let p = speech_probability(&mut voice.vad, &decoded);
                     voice.level(&mut decoded, p, crate::config::DEFAULT_PEER_VOLUME);
                     limit_mix(&mut decoded, 1., &mut limiter);
-                    energy[pass][1] += decoded.iter().map(|x| x * x).sum::<f32>();
+                    if repeat + 1 == repeats {
+                        energy[pass][1] += decoded.iter().map(|x| x * x).sum::<f32>();
+                    }
                 }
             }
             let delta = |i: usize| 10. * (energy[2][i] / energy[0][i]).log10();
