@@ -19,6 +19,7 @@ use std::{
 use tokio::{sync::watch, task::JoinSet, time::timeout};
 
 #[cfg(test)]
+#[path = "legacy_lobby/local_integration.rs"]
 mod local_integration;
 
 const FALLBACK_DELAY: Duration = Duration::from_secs(3);

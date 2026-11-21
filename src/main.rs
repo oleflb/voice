@@ -1,8 +1,10 @@
 mod audio;
+#[path = "legacy_call.rs"]
 mod call;
 mod config;
 mod discovery;
 mod dsp;
+#[path = "legacy_lobby.rs"]
 mod lobby;
 mod shutdown;
 mod ui;
