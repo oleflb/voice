@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/voice-core"]
+resolver = "3"
+
 [package]
 name = "voice"
 version = "0.1.0"
