@@ -126,11 +126,27 @@ struct View {
 struct PeerRow {
     id: nostr_sdk::PublicKey,
     name: String,
-    late: bool,
+    connection: char,
     muted: bool,
     local_mute: bool,
     volume: f32,
     last_speech: Option<Instant>,
+}
+
+impl PeerRow {
+    fn label(&self) -> Span<'static> {
+        let label = Span::raw(format!(
+            "{} {} {}",
+            self.name,
+            indicator(self.muted, self.last_speech),
+            self.connection
+        ));
+        if self.connection == ' ' {
+            label
+        } else {
+            label.dim()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -186,11 +202,11 @@ impl Form {
 
 fn indicator(muted: bool, speech: Option<Instant>) -> &'static str {
     if muted {
-        "[mic muted]"
+        "○"
     } else if speech.is_some_and(|at| at.elapsed() < Duration::from_millis(300)) {
-        "[talking]"
+        "≋"
     } else {
-        ""
+        " "
     }
 }
 
@@ -282,7 +298,6 @@ impl View {
                     voice_core::valid_name(value),
                     "Use a display name of 1–64 bytes"
                 );
-
                 lobby.config.name = value.to_owned();
                 if let Err(error) = lobby.config.persist() {
                     lobby.config.name.clear();
@@ -323,11 +338,10 @@ impl View {
                 let mut names = Vec::new();
                 if let Some((call, peers)) = active.filter(|(c, _)| c.room.secret == room.secret) {
                     names.push(Span::styled("[active] ", Style::new().green()));
-                    names.push(Span::raw(format!("{} (you)", call.name)));
+                    names.push(Span::raw(call.name.clone()).bold());
                     for peer in peers {
                         names.push(Span::raw(", "));
-                        let name = Span::raw(peer.name.clone());
-                        names.push(if peer.late { name.dim() } else { name });
+                        names.push(Span::raw(peer.name.clone()));
                     }
                 } else {
                     names.push(Span::raw(match &*lobby.rosters[index].borrow() {
@@ -391,7 +405,6 @@ impl View {
             frame.render_widget(ratatui::widgets::Clear, popup);
             frame.render_widget(Paragraph::new(lines).block(panel(form.title())), popup);
         }
-
         if let Some(form @ (Form::Delete | Form::Leave)) = &self.form {
             let content = if matches!(form, Form::Delete) {
                 let room = &lobby.config.rooms[self.room];
@@ -523,8 +536,12 @@ impl View {
                 .map(|(&id, p)| PeerRow {
                     id,
                     name: p.member.name.clone(),
-                    late: p.status != Status::Connected
-                        || p.seen.elapsed() >= Duration::from_secs(20),
+                    connection: match (p.status, p.seen.elapsed()) {
+                        (Status::Connected, age) if age < Duration::from_secs(20) => ' ',
+                        (Status::Failed | Status::Disconnected, _) => '!',
+                        (_, age) => ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+                            [(age.as_millis() / 150 % 10) as usize],
+                    },
                     muted: p.muted,
                     local_mute: p.local_mute,
                     volume: p.volume,
@@ -551,23 +568,13 @@ impl View {
                 } else {
                     ""
                 };
-                let row = Line::from(format!(
-                    "{} {} {local} {:.0}%",
-                    peer.name,
-                    indicator(peer.muted, peer.last_speech),
-                    peer.volume * 100.0
-                ));
-                lines.push(if peer.late { row.dim() } else { row });
+                lines.push(Line::from(vec![
+                    peer.label(),
+                    Span::raw(format!(" {:.0}% {local}", peer.volume * 100.0)),
+                ]));
             }
-            let status = if audio_available {
-                indicator(muted, speech)
-            } else {
-                "[chat-only]"
-            };
-            let block = self.pane(
-                Pane::People,
-                &format!("{} | {} (you) {status}", call.room.name, call.name),
-            );
+            let status = if audio_available { "" } else { " [chat-only]" };
+            let block = self.pane(Pane::People, &format!("{}{status}", call.room.name));
             self.level_area = block.inner(people);
             let selected = self
                 .level_rows
@@ -618,10 +625,10 @@ impl View {
         let help = match self.focus {
             Pane::Chat => "\nEnter send · ↑↓ scroll · Alt+arrows/hjkl change pane · Esc back",
             Pane::Sessions if !audio_available => {
-                "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nt chat · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nm enable mic · t chat · Esc leave · q quit"
             }
             Pane::People if !audio_available => {
-                "Alt+arrows/hjkl focus · arrows/hjkl select · t chat · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · arrows/hjkl select · m enable mic · t chat · Esc leave · q quit"
             }
             Pane::Sessions => {
                 "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nt chat · m mic mute · Esc leave · q quit"
@@ -896,7 +903,7 @@ impl View {
                         }
                         KeyCode::Char(ch @ ('+' | '-')) if self.focus == Pane::People => {
                             let up = ch == '+';
-                            let changed = match self.selected {
+                            match self.selected {
                                 LevelRow::Me => return Ok(true),
                                 LevelRow::Peer(id) => {
                                     let Some(peer) = state.peers.get_mut(&id) else {
@@ -908,11 +915,7 @@ impl View {
                                     let volume = peer.volume;
                                     let identity = peer.member.identity;
                                     state.levels.peers.insert(identity, volume);
-                                    true
                                 }
-                            };
-                            if !changed {
-                                return Ok(true);
                             }
                             lobby.config.levels = state.levels.clone();
                             drop(state);
