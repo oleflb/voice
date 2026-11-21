@@ -7,6 +7,8 @@ mod dsp;
 #[path = "legacy_lobby.rs"]
 mod lobby;
 #[allow(dead_code)]
+mod peer;
+#[allow(dead_code)]
 #[path = "call.rs"]
 mod rtc_call;
 mod shutdown;
