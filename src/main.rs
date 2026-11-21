@@ -11,6 +11,9 @@ mod peer;
 #[allow(dead_code)]
 #[path = "call.rs"]
 mod rtc_call;
+#[allow(dead_code)]
+#[path = "lobby.rs"]
+mod rtc_lobby;
 mod shutdown;
 mod stun;
 mod ui;
