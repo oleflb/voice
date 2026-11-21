@@ -292,7 +292,7 @@ pub async fn connect(
                 state
                     .levels
                     .peers
-                    .get(&id)
+                    .get(&nostr_sdk::PublicKey::from_byte_array(*id.as_bytes()))
                     .copied()
                     .unwrap_or(crate::config::DEFAULT_PEER_VOLUME),
             )

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use directories::ProjectDirs;
+use nostr_sdk::SecretKey;
 use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
@@ -30,6 +31,13 @@ pub fn valid(s: &str, max: usize) -> bool {
 }
 
 impl Room {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            secret: SecretKey::generate().to_secret_bytes(),
+        }
+    }
+
     pub fn key(&self, label: &[u8]) -> [u8; 32] {
         hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &self.secret), label)
             .as_ref()
@@ -52,7 +60,7 @@ pub const DEFAULT_PEER_VOLUME: f32 = 0.5;
 pub struct Levels {
     pub output: f32,
     pub input: f32,
-    pub peers: std::collections::BTreeMap<iroh::EndpointId, f32>,
+    pub peers: std::collections::BTreeMap<nostr_sdk::PublicKey, f32>,
     #[serde(default)]
     peak_relative: bool,
 }
@@ -100,7 +108,7 @@ impl Config {
             rooms: Vec::new(),
             levels: Levels::default(),
             devices: Default::default(),
-            identity: random(),
+            identity: SecretKey::generate().to_secret_bytes(),
             temporary,
             storage: None,
         }
@@ -200,7 +208,7 @@ mod tests {
     fn legacy_peer_gain_moves_to_balanced_midpoint_once() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("voice.json");
-        let id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let id = nostr_sdk::Keys::generate().public_key();
         let mut profile = Config::fresh(false);
         profile.levels.peers.insert(id, 1.0);
         profile.levels.input = 12.;
@@ -231,7 +239,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&old)?)?;
         let mut config = Config::open_at(path.clone())?;
         assert_eq!((config.levels.output, config.levels.input), (1.0, 1.0));
-        let id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let id = nostr_sdk::Keys::generate().public_key();
         config.levels.output = 4.0;
         config.levels.input = 1.2;
         config.levels.peers.insert(id, 0.75);

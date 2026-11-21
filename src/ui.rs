@@ -903,7 +903,10 @@ impl View {
                                         return Ok(true);
                                     }
                                     let volume = peer.volume;
-                                    state.levels.peers.insert(id, volume);
+                                    state.levels.peers.insert(
+                                        nostr_sdk::PublicKey::from_byte_array(*id.as_bytes()),
+                                        volume,
+                                    );
                                     true
                                 }
                             };
