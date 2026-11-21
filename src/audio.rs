@@ -1103,6 +1103,104 @@ mod tests {
     }
 
     #[test]
+    fn rtc_delivers_opus_after_a_gap_in_time_for_playout() -> Result<()> {
+        use anyhow::Context;
+        use str0m::{
+            Candidate, Event, Input, Output, Rtc,
+            media::{Direction, MediaKind},
+            net::Receive,
+            rtp::RtpWrite,
+        };
+
+        let mut packets = BTreeMap::new();
+        let mut advance = |sender: &mut Rtc, receiver: &mut Rtc, now| -> Result<()> {
+            sender.handle_input(Input::Timeout(now))?;
+            receiver.handle_input(Input::Timeout(now))?;
+            let mut transfer = |from: &mut Rtc, to: &mut Rtc| -> Result<()> {
+                loop {
+                    match from.poll_output()? {
+                        Output::Timeout(_) => return Ok(()),
+                        Output::Transmit(tx) => {
+                            let packet =
+                                Receive::new(tx.proto, tx.source, tx.destination, &tx.contents)?;
+                            to.handle_input(Input::Receive(now, packet))?;
+                        }
+                        Output::Event(Event::MediaData(data)) => {
+                            packets.insert(data.time.numer(), Bytes::from_owner(data.data));
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            transfer(sender, receiver)?;
+            transfer(receiver, sender)
+        };
+
+        let mut now = Instant::now();
+        let (mut sender, mut receiver) = (crate::peer::new_rtc(now), crate::peer::new_rtc(now));
+        for (rtc, port) in [(&mut sender, 10000), (&mut receiver, 10001)] {
+            rtc.add_local_candidate(Candidate::host(([127, 0, 0, 1], port).into(), "udp")?)
+                .context("invalid test candidate")?;
+        }
+        let mut offer = sender.sdp_api();
+        let mid = offer.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        let (offer, pending) = offer.apply().context("missing audio offer")?;
+        let answer = receiver.sdp_api().accept_offer(offer)?;
+        sender.sdp_api().accept_answer(pending, answer)?;
+        for _ in 0..300 {
+            if sender.is_connected() && receiver.is_connected() {
+                break;
+            }
+            now += Duration::from_millis(10);
+            advance(&mut sender, &mut receiver, now)?;
+        }
+        assert!(sender.is_connected() && receiver.is_connected());
+
+        let pt = sender
+            .writer(mid)
+            .context("missing audio stream")?
+            .payload_params()
+            .next()
+            .context("missing Opus")?
+            .pt();
+        // Skip an RTP sequence number to simulate one lost 20 ms packet.
+        for index in [0u32, 1, 3] {
+            sender
+                .direct_api()
+                .stream_tx_by_mid(mid, None)
+                .context("missing RTP stream")?
+                .write_rtp(RtpWrite::new(
+                    pt,
+                    u64::from(10 + index).into(),
+                    index * FRAME as u32,
+                    now,
+                    [0xf8, 0xff, 0xfe],
+                ));
+            for _ in 0..20 {
+                now += Duration::from_millis(1);
+                advance(&mut sender, &mut receiver, now)?;
+            }
+        }
+
+        let first = *packets.keys().next().context("no Opus received")?;
+        assert!(
+            packets.contains_key(&(first + 3 * FRAME as u64)),
+            "str0m held audio after a single lost packet: {:?}",
+            packets.keys().collect::<Vec<_>>()
+        );
+        let mut jitter = Jitter::default();
+        let mut playout = Playout::new()?;
+        for concealed in [false, false, true, false] {
+            let part = jitter
+                .packet(&mut packets)
+                .context("missing playout frame")?;
+            assert_eq!(part.0.is_empty(), concealed);
+            assert!(playout.render(&[part]).is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn speech_survives_opus_round_trip() {
         let samples = std::array::from_fn::<_, FRAME, _>(|i| (i as f32 * 0.11).sin() * 0.2);
         let mut encoder = OpusEncoder::new(48_000, 1, Application::Voip).unwrap();
