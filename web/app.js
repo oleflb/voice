@@ -1,3 +1,5 @@
+import { startCall } from "./peer.js";
+
 const { create_invite, installation_key, join, room_name, valid_name } =
   window.wasmBindings ?? await new Promise(resolve =>
     window.addEventListener("TrunkApplicationStarted", () => resolve(window.wasmBindings), { once: true }));
@@ -5,10 +7,10 @@ const { create_invite, installation_key, join, room_name, valid_name } =
 const $ = id => document.getElementById(id);
 const status = text => { $("status").textContent = text; };
 const relay = new URL(location.href).searchParams.get("relay") ?? "";
-let current, selected;
+let current, selected, enter;
 
 function view(id, heading) {
-  for (const panel of ["profile", "lobby"]) $(panel).hidden = panel !== id;
+  for (const panel of ["profile", "lobby", "call"]) $(panel).hidden = panel !== id;
   $("where").textContent = heading;
   status("");
 }
@@ -16,28 +18,63 @@ function view(id, heading) {
 function stop() {
   current?.abort();
   current = null;
+  enter = null;
 }
 
-async function openRoom() {
+async function openRoom(active) {
+  if (active && enter && selected === $("rooms").value) { enter(); return; }
   stop();
   selected = $("rooms").value;
-  $("copy").disabled = !selected;
+  $("join").disabled = $("copy").disabled = !selected;
   if (!selected) { $("roster").textContent = "No room selected"; return; }
-  $("roster").textContent = "Checking…";
-  const { signal } = current = new AbortController();
+  const name = localStorage.getItem("voice.name");
+  const controller = current = new AbortController();
+  const { signal } = controller;
+  const report = text => { if (!signal.aborted) status(text); };
+  let room, receive, rosterTimer, started = false;
+  function start() {
+    if (started || !active || !room) return;
+    started = true;
+    clearInterval(rosterTimer);
+    report("");
+    receive = startCall(room, signal, name, report);
+    $("text").focus();
+  }
+  enter = () => {
+    active = true;
+    view("call", "Room");
+    $("title").textContent = room_name(selected);
+    report("Joining…");
+    start();
+  };
+  if (active) enter(); else {
+    $("roster").textContent = "Checking…";
+  }
   try {
-    const room = await join(selected, localStorage.getItem("voice.identity"), localStorage.getItem("voice.name"), relay);
+    room = await join(selected, localStorage.getItem("voice.identity"), name, relay);
     if (signal.aborted) { await room.close(); return; }
-    const roster = preview();
-    const timer = setInterval(roster.draw, 5000);
-    signal.addEventListener("abort", () => { clearInterval(timer); room.close(); }, { once: true });
-    room.query().catch(e => { if (!signal.aborted) status(e.message); });
+    signal.addEventListener("abort", async () => {
+      try {
+        if (started) await Promise.race([room.depart(), new Promise(r => setTimeout(r, 1000))]);
+      } catch { /* Heartbeat expiry handles an unreachable relay. */ }
+      finally { await room.close(); }
+    }, { once: true });
+    start();
+    if (!active) {
+      const roster = preview();
+      receive = roster.receive;
+      rosterTimer = setInterval(roster.draw, 5000);
+      signal.addEventListener("abort", () => clearInterval(rosterTimer), { once: true });
+      room.query().catch(e => report(e.message));
+    }
     while (!signal.aborted) {
       const [member, update] = JSON.parse(await room.next());
-      if (!signal.aborted) roster.receive(member, update);
+      if (!signal.aborted) receive(member, update);
     }
   } catch (e) {
-    if (!signal.aborted) { $("roster").textContent = "Presence unavailable"; status(e.message); }
+    if (!signal.aborted) enter = null;
+    if (!signal.aborted && !active) $("roster").textContent = "Presence unavailable";
+    report(e.message);
   }
 }
 
@@ -65,7 +102,7 @@ function lobby() {
   const rooms = saved();
   $("rooms").replaceChildren(...rooms.map(invite => new Option(room_name(invite), invite)));
   $("rooms").value = rooms.includes(selected) ? selected : rooms[0] ?? "";
-  openRoom();
+  openRoom(false);
 }
 
 function profile() {
@@ -104,11 +141,17 @@ async function save(invite, form) {
 }
 submit("create", form => save(create_invite(form.elements.name.value.trim()), form));
 submit("import", form => save(form.elements.invite.value.trim(), form));
-$("rooms").onchange = () => openRoom();
+$("rooms").onchange = () => openRoom(false);
+$("rooms").ondblclick = () => openRoom(true);
+$("rooms").onkeydown = event => {
+  if (event.key === "Enter") { event.preventDefault(); openRoom(true); }
+};
+$("join").onclick = () => openRoom(true);
+$("leave").onclick = lobby;
 window.addEventListener("pagehide", stop);
 window.addEventListener("pageshow", event => { if (event.persisted) lobby(); });
 $("rename").onclick = profile;
-$("copy").onclick = async () => {
+$("copy").onclick = $("share").onclick = async () => {
   try { await navigator.clipboard.writeText(selected); status("Invite copied."); }
   catch { window.prompt("Copy this private invite:", selected); }
 };

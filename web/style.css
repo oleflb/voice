@@ -9,6 +9,7 @@ h2 { margin: .6rem 0; overflow-wrap: anywhere; }
 h3 { margin: 0 0 .9rem; font-size: 1rem; }
 .bar { justify-content: space-between; margin-bottom: 1rem; }
 .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.room { grid-template-columns: minmax(12rem, 1fr) 2fr; }
 .columns > section, #profile { padding: 1rem; min-width: 0; border: 1px solid #42534b; border-radius: .4rem; }
 form { align-items: end; margin: .75rem 0; }
 label { flex: 1; min-width: 8rem; }
@@ -22,7 +23,18 @@ button:disabled { opacity: .55; cursor: default; }
 .actions { margin: .65rem 0; }
 ul, ol { list-style: none; padding: 0; margin: 0; overflow-wrap: anywhere; }
 li { margin-bottom: .65rem; }
+#peers button { border: 0; padding: .15rem .35rem; margin-left: -.35rem; background: transparent; text-align: left; overflow-wrap: anywhere; }
+#peers button:hover:not(:disabled), #peers button:focus-visible { background: #324d3c; }
+#peers button:disabled { opacity: 1; }
+.dim-name .participant-name { color: #a1afa7; }
+.connection { display: inline-block; width: 1em; height: 1em; line-height: 1; vertical-align: -.08em; text-align: center; }
+.connection.waiting::before { content: ""; display: inline-block; width: .7em; height: .7em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .connection.waiting::before { animation: none; } }
+#chat { height: min(45vh, 26rem); overflow-y: auto; }
+#compose { flex-wrap: nowrap; }
+#compose input { flex: 1; }
 #where, #status, #roster, small { color: #b5c9bd; }
 small { display: block; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-@media (max-width: 40rem) { .columns { grid-template-columns: 1fr; } } }
+@media (max-width: 40rem) { .columns { grid-template-columns: 1fr; } }
