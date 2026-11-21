@@ -4,11 +4,16 @@ use crate::{
     config::{Config, Room},
     discovery,
 };
+use anyhow::Result;
 use iroh::Endpoint;
 use nostr_sdk::{Client, Keys};
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::{sync::watch, task::JoinSet, time::timeout};
@@ -23,7 +28,8 @@ pub struct Lobby {
     pub rosters: Vec<watch::Receiver<Option<Vec<String>>>>,
     pub active: watch::Sender<Option<Arc<Call>>>,
     capture: audio::CaptureOptions,
-    audio_thread: Option<std::thread::JoinHandle<()>>,
+    worker: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+    capture_requested: bool,
     endpoint: Endpoint,
     discovery: Arc<tokio::sync::OnceCell<Client>>,
     publishers: JoinSet<()>,
@@ -38,7 +44,8 @@ impl Lobby {
             rosters: Vec::new(),
             active,
             capture,
-            audio_thread: None,
+            worker: None,
+            capture_requested: false,
             endpoint,
             discovery: Arc::default(),
             publishers: JoinSet::new(),
@@ -178,27 +185,70 @@ impl Lobby {
         let call = Call::new(room.clone(), self.config.name.clone());
         call.state.lock().levels = self.config.levels.clone();
         self.leave();
-        let audio_call = call.clone();
-        let capture = self.capture;
-        let thread = std::thread::Builder::new()
+        self.active.send_replace(Some(call.clone()));
+        self.start_audio(call, true)?;
+        Ok(true)
+    }
+    fn stop_worker(&mut self) {
+        if let Some((stop, worker)) = self.worker.take() {
+            stop.store(true, Ordering::Release);
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
+    fn start_audio(&mut self, call: Arc<Call>, mic: bool) -> Result<()> {
+        self.stop_worker();
+        self.capture_requested = mic;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let options = self.capture;
+        let devices = self.config.devices.clone();
+        call.state.lock().set_mic(false);
+        let worker = thread::Builder::new()
             .name("voice-audio".into())
             .stack_size(8 << 20)
             .spawn(move || {
-                if let Err(error) = audio::run(&audio_call, capture) {
-                    let mut state = audio_call.state.lock();
-                    state.set_audio_available(false);
-                    state.log(format!(
-                        "Audio unavailable: {error}. Chat is still available."
-                    ));
+                if let Err(e) = audio::run(&call, options, mic, &devices, &flag) {
+                    let mut state = call.state.lock();
+                    state.audio_available = false;
+                    state.redraw = true;
+                    state.set_mic(false);
+                    state.log(format!("Audio unavailable: {e}. Chat is still available."));
                 }
             })?;
-        self.audio_thread = Some(thread);
-        self.active.send_replace(Some(call));
-        Ok(true)
+        self.worker = Some((stop, worker));
+        Ok(())
     }
-
+    pub fn toggle_mic(&mut self, call: Arc<Call>) -> Result<()> {
+        let enable = !self.mic_requested();
+        self.start_audio(call, enable)
+    }
+    pub fn update_audio(&mut self) -> Result<()> {
+        let call = self.active.borrow().clone();
+        if self.capture_requested
+            && self
+                .worker
+                .as_ref()
+                .is_none_or(|(_, worker)| worker.is_finished())
+            && let Some(call) = call
+        {
+            self.start_audio(call, false)?;
+        }
+        Ok(())
+    }
+    fn mic_requested(&self) -> bool {
+        self.capture_requested
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|(_, worker)| !worker.is_finished())
+    }
     pub fn leave(&mut self) {
-        stop_audio(self.active.send_replace(None), self.audio_thread.take());
+        if let Some(call) = self.active.send_replace(None) {
+            call.close();
+        }
+        self.stop_worker();
+        self.capture_requested = false;
     }
 
     pub async fn shutdown(mut self) {
@@ -206,39 +256,6 @@ impl Lobby {
         drop(self.active);
         let _ = timeout(Duration::from_secs(3), self.publishers.join_all()).await;
     }
-}
-
-fn stop_audio(call: Option<Arc<Call>>, thread: Option<std::thread::JoinHandle<()>>) {
-    if let Some(call) = call {
-        call.close();
-    }
-    if let Some(thread) = thread {
-        thread.thread().unpark();
-        let _ = thread.join();
-    }
-}
-
-#[test]
-fn leave_releases_device_before_next_open() {
-    let room = Room {
-        name: "test".into(),
-        secret: [0; 32],
-    };
-    let call = Call::new(room, "me".into());
-    let worker_call = call.clone();
-    let device = Arc::new(());
-    let open_device = device.clone();
-    let thread = std::thread::spawn(move || {
-        while !worker_call.state.lock().closed {
-            std::thread::park_timeout(Duration::from_millis(50));
-        }
-        drop(open_device);
-    });
-    stop_audio(Some(call), Some(thread));
-    assert!(
-        Arc::try_unwrap(device).is_ok(),
-        "previous device still open"
-    );
 }
 
 async fn roster_changed(

@@ -119,6 +119,7 @@ struct View {
     draft: Option<TextEdit>,
     form: Option<Form>,
     notice: String,
+    last_mic_key: Option<Instant>,
 }
 
 struct PeerRow {
@@ -463,7 +464,7 @@ impl View {
                 .collect::<Vec<_>>();
             (
                 state.audio_available,
-                state.muted,
+                state.mic_off(),
                 state.last_speech,
                 state.levels.output,
                 state.levels.input,
@@ -591,6 +592,9 @@ impl View {
         let event = event.into();
         let key = event.code;
         if event.kind == KeyEventKind::Release {
+            if key == KeyCode::Char('m') {
+                self.last_mic_key = None;
+            }
             return Ok(true);
         }
         if event.modifiers == KeyModifiers::CONTROL && key == KeyCode::Char('c') {
@@ -751,8 +755,18 @@ impl View {
                     let mut state = call.state.lock();
                     match key {
                         KeyCode::Char('t') => self.focus = Pane::Chat,
-                        _ if !state.audio_available => {}
-                        KeyCode::Char('m') => state.toggle_mute(),
+                        KeyCode::Char('m') => {
+                            // Older terminals encode autorepeat as a stream of presses without releases.
+                            let recent = self
+                                .last_mic_key
+                                .replace(Instant::now())
+                                .is_some_and(|at| at.elapsed() < Duration::from_millis(750));
+                            if event.kind != KeyEventKind::Press || recent {
+                                return Ok(true);
+                            }
+                            drop(state);
+                            lobby.toggle_mic(call)?;
+                        }
                         KeyCode::Char('x') if self.focus == Pane::People => {
                             if let LevelRow::Peer(id) = self.selected
                                 && let Some(peer) = state.peers.get_mut(&id)
@@ -834,6 +848,16 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
         loop {
             if *quitting.borrow() || (had_terminal && !std::io::stdout().is_terminal()) {
                 break;
+            }
+            lobby.update_audio()?;
+            // Device probing can print backend diagnostics directly to the terminal.
+            if lobby
+                .active
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| std::mem::take(&mut c.state.lock().redraw))
+            {
+                terminal.resize(terminal.size()?.into())?;
             }
             terminal.draw(|frame| view.draw(frame, lobby))?;
             let capture = view.form.is_none() && !view.level_rows.is_empty();

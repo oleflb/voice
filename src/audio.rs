@@ -1,14 +1,18 @@
 use crate::call::Call;
 use crate::dsp::capture_processor;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
 use maudio::{
     audio::sample_rate::SampleRate,
+    backend::Backend,
+    context::{Context, ContextBuilder, ContextOps},
     device::device_builder::{DeviceBuilder, DeviceBuilderOps, DuplexDeviceBuilder},
+    device::device_id::DeviceId,
 };
 use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 use sonora_agc2::vad_wrapper::VoiceActivityDetectorWrapper;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -19,6 +23,74 @@ use std::{
 const BLOCK: usize = 480;
 pub(crate) const FRAME: usize = BLOCK * 2;
 type Block = [f32; BLOCK];
+
+struct RunningDevice(maudio::device::Device<f32>);
+impl Drop for RunningDevice {
+    fn drop(&mut self) {
+        // Wake the backend data loop before uninitializing a disconnected PulseAudio stream.
+        let _ = self.0.device_stop();
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DeviceChoices {
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub enum Port {
+    Input,
+    Output,
+}
+
+impl Port {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Input => "Microphone",
+            Self::Output => "Speakers",
+        }
+    }
+    fn devices(self, context: &Context) -> Result<Vec<(String, DeviceId)>> {
+        let mut list = Vec::new();
+        context.with_devices(|outputs, inputs| {
+            let devices = match self {
+                Self::Input => inputs,
+                Self::Output => outputs,
+            };
+            list.extend(
+                devices
+                    .iter()
+                    .map(|d| (d.device_name().to_owned(), d.device_id())),
+            );
+        })?;
+        Ok(list)
+    }
+    fn resolve(self, context: &Context, name: Option<&str>) -> Result<Option<DeviceId>> {
+        let Some(name) = name else { return Ok(None) };
+        let mut matches = self
+            .devices(context)?
+            .into_iter()
+            .filter(|(n, _)| n == name);
+        let Some((_, id)) = matches.next() else {
+            anyhow::bail!("{} ‘{name}’ is unavailable", self.label())
+        };
+        ensure!(
+            matches.next().is_none(),
+            "Multiple devices named ‘{name}’; choose System default or rename the device"
+        );
+        Ok(Some(id))
+    }
+}
+
+fn device_context() -> Result<Context> {
+    Ok(ContextBuilder::new()
+        .preferred_backends(
+            Backend::all_supported_on_this_platform()
+                .filter(|b| !matches!(b, Backend::Custom | Backend::Null)),
+        )
+        .build()?)
+}
 
 #[cfg(test)]
 fn speaking(samples: &[f32]) -> bool {
@@ -312,12 +384,18 @@ impl Default for CaptureOptions {
     }
 }
 
-pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
+pub fn run(
+    call: &Call,
+    options: CaptureOptions,
+    mic_enabled: bool,
+    devices: &DeviceChoices,
+    stop: &AtomicBool,
+) -> Result<()> {
     let capture = Arc::new(ArrayQueue::new(4));
     let playback = Arc::new(ArrayQueue::<Block>::new(4));
     let (input_queue, output_queue) = (capture.clone(), playback.clone());
     let worker = thread::current();
-    let mut device = duplex_device().with_callback(move |_, output, input| {
+    let callback = move |output: &mut [f32], input: &[f32]| {
         output.fill(0.0);
         let (Ok(mic), Ok(render)) = (<&Block>::try_from(input), <&mut Block>::try_from(output))
         else {
@@ -328,7 +406,35 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
         }
         input_queue.force_push((Instant::now(), *mic, *render));
         worker.unpark();
-    })?;
+    };
+    // A null backend would report a working microphone on a machine with no audio.
+    let context = device_context()?;
+    let output = Port::Output.resolve(&context, devices.output.as_deref())?;
+    let mut device = if mic_enabled {
+        let mut builder = duplex_device();
+        if let Some(id) = Port::Input.resolve(&context, devices.input.as_deref())? {
+            builder.capture_device_id(&id);
+        }
+        if let Some(id) = &output {
+            builder.playback_device_id(id);
+        }
+        builder
+            .context(&context)
+            .state_notifier()
+            .with_callback(move |_, out, input| callback(out, input))?
+    } else {
+        let mut builder = DeviceBuilder::playback().f32();
+        if let Some(id) = &output {
+            builder.playback_device_id(id);
+        }
+        builder
+            .context(&context)
+            .state_notifier()
+            .sample_rate(SampleRate::Sr48000)
+            .playback_channels(1)
+            .period_size_frames(BLOCK as u32)
+            .with_callback(move |_, out| callback(out, &[0.; BLOCK]))?
+    };
     let mut encoder = voice_encoder()?;
     let mut processor = capture_processor(options.echo_cancellation, options.sender_agc);
     let mut boost = 1.0;
@@ -338,20 +444,39 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
     let mut mic_frame = [0.0; FRAME];
     let mut have_first_half = false;
     let mut frame_started = Instant::now();
-    let mut seq = 0u64;
+    let mut seq = (call.started.elapsed().as_secs_f64() * 50.) as u64;
     let mut mic_vad = vad();
     let mut gate = SendGate::default();
     device.device_start()?;
-    call.state.lock().set_audio_available(true);
+    let notifications = device.get_state_notifier();
+    let _device = RunningDevice(device);
+    let mut last_callback = Instant::now();
+    {
+        let mut state = call.state.lock();
+        state.audio_available = true;
+        state.redraw = true;
+        state.set_mic(mic_enabled);
+    }
 
     loop {
-        if call.state.lock().closed {
+        if stop.load(Ordering::Acquire) || call.state.lock().closed {
             return Ok(());
         }
+        ensure!(
+            !notifications.as_ref().is_some_and(|n| n.stopped()
+                || n.interruption_began()
+                || (mic_enabled && devices.input.is_some() && n.rerouted())),
+            "Audio device disconnected or rerouted"
+        );
         let Some((captured_at, mic, render)) = capture.pop() else {
+            ensure!(
+                last_callback.elapsed() < Duration::from_secs(3),
+                "Audio device stopped responding"
+            );
             thread::park_timeout(Duration::from_millis(50));
             continue;
         };
+        last_callback = Instant::now();
         let state = call.state.lock();
         if state.peers.is_empty() {
             voices.clear();
@@ -370,7 +495,9 @@ pub fn run(call: &Call, options: CaptureOptions) -> Result<()> {
         if options.echo_cancellation {
             processor.process_render_f32(&[&render], &mut [&mut [0.0; BLOCK]])?;
         }
-        processor.process_capture_f32(&[&mic], &mut [&mut clean])?;
+        if mic_enabled {
+            processor.process_capture_f32(&[&mic], &mut [&mut clean])?;
+        }
         let mut state = call.state.lock();
         if !have_first_half {
             frame_started = captured_at - Duration::from_millis(10);

@@ -57,12 +57,14 @@ impl Peer {
 pub struct Call {
     pub room: Room,
     pub name: String,
+    pub started: Instant,
     pub state: Mutex<State>,
 }
 
 pub struct State {
     pub closed: bool,
     pub audio_available: bool,
+    pub redraw: bool,
     pub muted: bool,
     pub mic_changed_at: Instant,
     pub levels: crate::config::Levels,
@@ -117,6 +119,12 @@ impl State {
         self.broadcast(Message::Mute(self.mic_off()));
     }
 
+    pub fn set_mic(&mut self, enabled: bool) {
+        self.muted = !enabled;
+        self.announce_mic();
+    }
+
+    #[cfg(test)]
     pub fn toggle_mute(&mut self) {
         if self.audio_available {
             self.muted = !self.muted;
@@ -124,6 +132,7 @@ impl State {
         }
     }
 
+    #[cfg(test)]
     pub fn set_audio_available(&mut self, available: bool) {
         self.audio_available = available;
         self.announce_mic();
@@ -135,9 +144,11 @@ impl Call {
         Arc::new(Self {
             room,
             name,
+            started: Instant::now(),
             state: Mutex::new(State {
                 closed: false,
                 audio_available: false,
+                redraw: false,
                 muted: false,
                 mic_changed_at: Instant::now(),
                 levels: Default::default(),

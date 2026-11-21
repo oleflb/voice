@@ -75,6 +75,8 @@ pub struct Config {
     pub rooms: Vec<Room>,
     #[serde(default)]
     pub levels: Levels,
+    #[serde(default)]
+    pub devices: crate::audio::DeviceChoices,
     #[serde(skip)]
     pub temporary: bool,
     #[serde(skip)]
@@ -97,6 +99,7 @@ impl Config {
             name: String::new(),
             rooms: Vec::new(),
             levels: Levels::default(),
+            devices: Default::default(),
             identity: random(),
             temporary,
             storage: None,
