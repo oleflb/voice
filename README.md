@@ -19,4 +19,4 @@ Run `voice` and enter your display name. Both you and your friends need internet
 
 1. **Create or import a room.** Press `n`, enter a room name, and press `Enter`. Press `c` to copy the invite, send it privately, then press `Esc` to return. If a friend sent you an invite, press `i`, paste it, and press `Enter` to save it.
 2. **Join the call.** Select the room with the arrow keys and press `Enter`.
-3. **Talk or type.** Press `m` to mute your mic or `t` to open chat. In chat, `Enter` sends and `Esc` goes back. Outside chat, `Esc` leaves the call.
+3. **Talk or type.** Press `m` to mute your mic or `t` to open chat. In chat, `Enter` sends and `Esc` goes back. Outside chat, press `Esc` then `y` to leave the call.

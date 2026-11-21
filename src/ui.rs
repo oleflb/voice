@@ -161,6 +161,7 @@ enum Form {
     Import,
     Share(String),
     Delete,
+    Leave,
 }
 
 impl Form {
@@ -171,6 +172,7 @@ impl Form {
             Self::Import => "Paste a private room invite",
             Self::Share(_) => "Secret invite — share privately",
             Self::Delete => "Delete session?",
+            Self::Leave => "Leave call?",
         }
     }
 }
@@ -236,7 +238,7 @@ impl View {
         self.draft = match form {
             Form::Name | Form::RoomName => Some(TextEdit::new(64)),
             Form::Import => Some(TextEdit::default()),
-            Form::Share(_) | Form::Delete => None,
+            Form::Share(_) | Form::Delete | Form::Leave => None,
         };
         self.form = Some(form);
         self.notice.clear();
@@ -267,7 +269,7 @@ impl View {
             Some(Form::Import) => {
                 self.room = lobby.add_room(Room::parse(value).context("Invalid room invite")?)?;
             }
-            Some(Form::Share(_) | Form::Delete) => {}
+            Some(Form::Share(_) | Form::Delete | Form::Leave) => {}
             None => {}
         }
         self.form = None;
@@ -322,22 +324,26 @@ impl View {
 
     fn draw(&mut self, frame: &mut ratatui::Frame, lobby: &Lobby) {
         self.draw_view(frame, lobby);
-        if let Some(form @ Form::Delete) = &self.form {
-            let room = &lobby.config.rooms[self.room];
-            let leave = if lobby
-                .active
-                .borrow()
-                .as_ref()
-                .is_some_and(|c| c.room.secret == room.secret)
-            {
-                " You will leave the call."
+        if let Some(form @ (Form::Delete | Form::Leave)) = &self.form {
+            let content = if matches!(form, Form::Delete) {
+                let room = &lobby.config.rooms[self.room];
+                let leave = if lobby
+                    .active
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.room.secret == room.secret)
+                {
+                    " You will leave the call."
+                } else {
+                    ""
+                };
+                format!(
+                    "Remove ‘{}’ from this device?{leave}\nOthers keep access.\n\ny delete · n/Esc cancel\n{}",
+                    room.name, self.notice
+                )
             } else {
-                ""
+                "y leave · n/Esc stay".into()
             };
-            let content = format!(
-                "Remove ‘{}’ from this device?{leave}\nOthers keep access.\n\ny delete · n/Esc cancel\n{}",
-                room.name, self.notice
-            );
             let popup = Paragraph::new(content)
                 .wrap(Wrap { trim: false })
                 .block(panel(form.title()));
@@ -372,7 +378,7 @@ impl View {
             header,
         );
         if let Some(form) = &self.form
-            && !matches!(form, Form::Delete)
+            && !matches!(form, Form::Delete | Form::Leave)
         {
             let (text, help) = match form {
                 Form::Share(invite) => (invite.as_str(), "c copy to clipboard · Esc close"),
@@ -615,6 +621,20 @@ impl View {
             }
             return Ok(true);
         }
+        if matches!(self.form, Some(Form::Leave)) {
+            match key {
+                KeyCode::Char('y') => {
+                    lobby.leave();
+                    self.focus = Pane::Sessions;
+                    self.chat_input = TextEdit::default();
+                    self.chat_scroll = 0;
+                    self.form = None;
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.form = None,
+                _ => {}
+            }
+            return Ok(true);
+        }
         if let Some(Form::Share(invite)) = &self.form {
             match key {
                 KeyCode::Char('c') => {
@@ -722,11 +742,7 @@ impl View {
                     self.focus = Pane::People;
                 }
             }
-            KeyCode::Esc => {
-                lobby.leave();
-                self.focus = Pane::Sessions;
-                self.chat_input = TextEdit::default();
-            }
+            KeyCode::Esc if active.is_some() => self.edit(Form::Leave),
             _ => {
                 if let Some(call) = active {
                     let mut state = call.state.lock();
@@ -960,6 +976,14 @@ mod tests {
         view.key(KeyCode::Esc, &mut first)?;
         assert_eq!(first.config.rooms.len(), 1);
         assert!(first.active.borrow().is_some());
+        view.key(KeyCode::Esc, &mut first)?;
+        assert!(matches!(view.form, Some(Form::Leave)));
+        terminal.draw(|f| view.draw(f, &first))?;
+        view.key(KeyCode::Esc, &mut first)?;
+        assert!(first.active.borrow().is_some());
+        view.key(KeyCode::Esc, &mut first)?;
+        view.key(KeyCode::Char('y'), &mut first)?;
+        assert!(first.active.borrow().is_none());
         view.key(KeyCode::Char('d'), &mut first)?;
         view.key(KeyCode::Char('y'), &mut first)?;
         assert!(first.config.rooms.is_empty() && first.rosters.is_empty());
