@@ -3,6 +3,7 @@ mod call;
 mod config;
 mod discovery;
 mod lobby;
+mod shutdown;
 mod ui;
 
 use anyhow::{Result, bail};
@@ -74,10 +75,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Lobby(capture) => {
+            let shutdown = shutdown::Shutdown::new()?;
             let config = Config::open(temporary)?;
             let endpoint = endpoint(config.identity, call::ALPN).await?;
             let mut lobby = lobby::Lobby::start(endpoint.clone(), config, capture);
-            let result = ui::run(&mut lobby);
+            let result = ui::run(&mut lobby, &shutdown);
+            shutdown.request();
             lobby.shutdown().await;
             endpoint.close().await;
             result

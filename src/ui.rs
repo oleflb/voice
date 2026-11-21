@@ -590,6 +590,9 @@ impl View {
     fn key(&mut self, event: impl Into<KeyEvent>, lobby: &mut Lobby) -> Result<bool> {
         let event = event.into();
         let key = event.code;
+        if event.kind == KeyEventKind::Release {
+            return Ok(true);
+        }
         if event.modifiers == KeyModifiers::CONTROL && key == KeyCode::Char('c') {
             return Ok(false);
         }
@@ -794,16 +797,44 @@ impl View {
     }
 }
 
-pub fn run(lobby: &mut Lobby) -> Result<()> {
+pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()> {
+    use std::io::IsTerminal;
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    let quitting = shutdown.subscribe();
+    let had_terminal = std::io::stdout().is_terminal();
     let mut terminal = ratatui::try_init()?;
     let mut view = View::default();
     if lobby.config.name.is_empty() {
         view.edit(Form::Name);
     }
     let result = (|| {
+        #[cfg(unix)]
+        crossterm::execute!(
+            std::io::stdout(),
+            event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        )?;
         crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste)?;
+        // Crossterm's Unix reader can spin on PTY EOF. Never join it during teardown.
+        let (tx, input) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("voice-input".into())
+            .spawn(move || {
+                loop {
+                    let event = event::read();
+                    let failed = event.is_err();
+                    if tx.send(event).is_err() || failed {
+                        break;
+                    }
+                }
+            })?;
         let mut mouse_enabled = false;
         loop {
+            if *quitting.borrow() || (had_terminal && !std::io::stdout().is_terminal()) {
+                break;
+            }
             terminal.draw(|frame| view.draw(frame, lobby))?;
             let capture = view.form.is_none() && !view.level_rows.is_empty();
             if capture != mouse_enabled {
@@ -814,10 +845,12 @@ pub fn run(lobby: &mut Lobby) -> Result<()> {
                 }
                 mouse_enabled = capture;
             }
-            if !event::poll(Duration::from_millis(150))? {
-                continue;
-            }
-            match event::read()? {
+            let event = match input.recv_timeout(Duration::from_millis(150)) {
+                Ok(event) => event?,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            match event {
                 Event::Mouse(mouse)
                     if capture
                         && matches!(
@@ -843,9 +876,7 @@ pub fn run(lobby: &mut Lobby) -> Result<()> {
                         edit.insert(text);
                     }
                 }
-                Event::Key(key)
-                    if key.kind != KeyEventKind::Release && !view.key(key, lobby)? =>
-                {
+                Event::Key(key) if !view.key(key, lobby)? => {
                     break;
                 }
                 _ => {}
@@ -853,12 +884,20 @@ pub fn run(lobby: &mut Lobby) -> Result<()> {
         }
         Ok(())
     })();
+    shutdown.request();
+    if had_terminal && !std::io::stdout().is_terminal() {
+        // Ratatui's destructor writes to the vanished TTY and can panic reporting that failure.
+        std::mem::forget(terminal);
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let _ = crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
     let _ = crossterm::execute!(
         std::io::stdout(),
         event::DisableMouseCapture,
         event::DisableBracketedPaste
     );
-    ratatui::restore();
+    let _ = ratatui::try_restore();
     result
 }
 

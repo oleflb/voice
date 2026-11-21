@@ -4255,6 +4255,7 @@ dependencies = [
  "rusty-opus",
  "serde",
  "serde_json",
+ "signal-hook",
  "sonora",
  "sonora-agc2",
  "sonora-simd",
