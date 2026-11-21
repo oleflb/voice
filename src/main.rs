@@ -2,6 +2,7 @@ mod audio;
 mod call;
 mod config;
 mod discovery;
+mod dsp;
 mod lobby;
 mod shutdown;
 mod ui;

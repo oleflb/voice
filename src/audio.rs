@@ -1,4 +1,5 @@
 use crate::call::Call;
+use crate::dsp::capture_processor;
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
@@ -7,13 +8,6 @@ use maudio::{
     device::device_builder::{DeviceBuilder, DeviceBuilderOps, DuplexDeviceBuilder},
 };
 use rusty_opus::{Application, OpusDecoder, OpusEncoder};
-use sonora::{
-    AudioProcessing, Config, StreamConfig,
-    config::{
-        EchoCanceller, GainController2, NoiseSuppression, NoiseSuppressionLevel,
-        TransparentModeType,
-    },
-};
 use sonora_agc2::vad_wrapper::VoiceActivityDetectorWrapper;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -301,29 +295,6 @@ fn duplex_device() -> DuplexDeviceBuilder<f32, f32> {
         .playback_channels(1)
         .period_size_frames(BLOCK as u32);
     device
-}
-
-fn capture_processor(echo_cancellation: bool, adaptive_gain: bool) -> AudioProcessing {
-    let format = StreamConfig::new(48_000, 1);
-    AudioProcessing::builder()
-        .capture_config(format)
-        .render_config(format)
-        .config(Config {
-            echo_canceller: echo_cancellation.then(|| EchoCanceller {
-                transparent_mode: TransparentModeType::Hmm,
-                ..Default::default()
-            }),
-            noise_suppression: Some(NoiseSuppression {
-                level: NoiseSuppressionLevel::Low,
-                ..Default::default()
-            }),
-            gain_controller2: adaptive_gain.then(|| GainController2 {
-                adaptive_digital: Some(Default::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .build()
 }
 
 #[derive(Clone, Copy)]
@@ -873,6 +844,65 @@ mod tests {
                 .take_while(|x| *x != 0.0)
                 .eq((1..=15 * 512).map(|i| i as f32 / 8192.0))
         );
+        Ok(())
+    }
+    #[test]
+    fn rendered_speech_reduces_delayed_echo() -> Result<()> {
+        let mut aec = capture_processor(true, false);
+        let mut baseline = capture_processor(false, false);
+        let speech: Vec<_> = phrase(0.6).flatten().collect();
+        let mut energy = [0.0; 2];
+        for block in 0..600 {
+            let render: Block = std::array::from_fn(|i| speech[(block * BLOCK + i) % speech.len()]);
+            let mic: Block = std::array::from_fn(|i| {
+                if block < 4 {
+                    0.
+                } else {
+                    0.45 * speech[((block - 4) * BLOCK + i) % speech.len()]
+                }
+            });
+            aec.process_render_f32(&[&render], &mut [&mut [0.; BLOCK]])?;
+            for (processor, sum) in [&mut aec, &mut baseline].into_iter().zip(&mut energy) {
+                let mut clean = [0.; BLOCK];
+                processor.process_capture_f32(&[&mic], &mut [&mut clean])?;
+                if block >= 400 {
+                    *sum += clean.iter().map(|x| x * x).sum::<f32>();
+                }
+            }
+        }
+        assert!(
+            energy[0] < energy[1] * 0.25,
+            "residual echo energy: {energy:?}"
+        );
+        Ok(())
+    }
+    #[test]
+    fn mixed_opus_durations_follow_the_rtp_clock() -> Result<()> {
+        let mut packets = BTreeMap::new();
+        let mut encoder = voice_encoder()?;
+        let mut at = 23_009; // RTP time need not be aligned to a mixer frame.
+        for count in [480, 480, 1920] {
+            let mut data = [0; 1200];
+            let sine: Vec<_> = (0..count).map(|i| (i as f32 * 0.04).sin() * 0.2).collect();
+            let n = encoder.encode(&sine, count, &mut data)?;
+            packets.insert(at, Bytes::copy_from_slice(&data[..n]));
+            at += count as u64;
+        }
+        let mut jitter = Jitter::default();
+        let mut voice = Playout::new()?;
+        for _ in 0..3 {
+            let mut parts = Vec::new();
+            let mut samples = voice.buffered.len();
+            while samples < FRAME {
+                let part = jitter.packet(&mut packets).expect("complete packet");
+                assert!(!part.0.is_empty(), "unexpected packet loss");
+                samples += part.1;
+                parts.push(part);
+            }
+            assert!(speaking(&voice.render(&parts).expect("20 ms of speech")));
+        }
+        assert!(voice.buffered.is_empty() && packets.is_empty());
+        assert_eq!(jitter.next, Some(at));
         Ok(())
     }
     #[test]
