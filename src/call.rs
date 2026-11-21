@@ -78,6 +78,13 @@ impl State {
             let _ = peer.connection.send_datagram(bytes.clone());
         }
     }
+    pub fn send_opus(&self, at: Instant, sample: u64, data: Arc<[u8]>) {
+        let sequence = sample / crate::audio::FRAME as u64;
+        let mut packet = Vec::with_capacity(8 + data.len());
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&data);
+        self.send_audio(at, Bytes::from(packet));
+    }
     fn current_peer(&mut self, id: &EndpointId, rank: &[u8; 32]) -> Result<&mut Peer> {
         self.peers
             .get_mut(id)
@@ -340,7 +347,10 @@ pub async fn connect(
             let mut state = call.state.lock();
             let peer = state.current_peer(&id, &rank)?;
             if !peer.muted {
-                peer.packets.insert(seq, packet.slice(8..));
+                peer.packets.insert(
+                    seq.saturating_mul(crate::audio::FRAME as u64),
+                    packet.slice(8..),
+                );
                 if peer.packets.len() > 8 {
                     peer.packets.pop_first();
                 }
