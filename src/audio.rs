@@ -620,56 +620,8 @@ mod tests {
         packets.insert(101 + RESYNC_GAP + u64::from(CONCEAL_FRAMES), first.clone());
         assert_eq!(jitter.packet(&mut packets), Some(first));
     }
-    #[test]
-    #[ignore = "offline loudness calibration: VOICE_CALIBRATION points to mono 48 kHz f32le inputs"]
-    fn render_calibration_passages() -> Result<()> {
-        let mode = std::env::var("VOICE_PIPELINE").unwrap_or_else(|_| "combined".into());
-        anyhow::ensure!(matches!(mode.as_str(), "baseline" | "sender" | "combined"));
-        for entry in std::fs::read_dir(std::env::var("VOICE_CALIBRATION")?)? {
-            let path = entry?.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("pcm") {
-                continue;
-            }
-            let mut encoder = voice_encoder()?;
-            let mut voice = Playout::new()?;
-            let mut limiter = 1.;
-            let mut output = Vec::new();
-            let mut capture = capture_processor(false, mode != "baseline");
-            for frame in std::fs::read(&path)?.as_chunks::<{ FRAME * 4 }>().0 {
-                let samples = frame
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .copied()
-                    .map(f32::from_le_bytes)
-                    .collect::<Vec<_>>();
-                let mut clean = [0.; FRAME];
-                for (src, dst) in samples
-                    .as_chunks::<BLOCK>()
-                    .0
-                    .iter()
-                    .zip(clean.as_chunks_mut::<BLOCK>().0)
-                {
-                    capture.process_capture_f32(&[src], &mut [dst])?;
-                }
-                let mut packet = [0; 1192];
-                let n = encoder.encode(&clean, FRAME, &mut packet)?;
-                let mut decoded = voice.decode(&Bytes::copy_from_slice(&packet[..n])).unwrap();
-                let p = speech_probability(&mut voice.vad, &decoded);
-                if mode != "sender" {
-                    voice.level(&mut decoded, p, crate::config::DEFAULT_PEER_VOLUME);
-                }
-                limit_mix(&mut decoded, 1., &mut limiter);
-                output.extend(decoded.into_iter().flat_map(f32::to_le_bytes));
-            }
-            std::fs::write(path.with_extension(&mode), output)?;
-        }
-        Ok(())
-    }
-
     fn phrase(scale: f32) -> impl Iterator<Item = [f32; FRAME]> {
-        // eSpeak NG: “Can you hear me clearly?”, mono 16 kHz signed LE PCM.
-        let pcm = include_bytes!("../tests/fixtures/first-phrase.s16le");
+        let pcm = include_bytes!("audio/fixtures/first-phrase.s16le");
         pcm.as_chunks::<{ FRAME / 3 * 2 }>()
             .0
             .iter()
