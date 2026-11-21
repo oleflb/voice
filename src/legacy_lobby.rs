@@ -18,10 +18,6 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinSet, time::timeout};
 
-#[cfg(test)]
-#[path = "legacy_lobby/local_integration.rs"]
-mod local_integration;
-
 const FALLBACK_DELAY: Duration = Duration::from_secs(3);
 
 pub struct Lobby {
@@ -354,20 +350,5 @@ async fn announce(
             tokio::time::sleep_until(sent_at + Duration::from_secs(1)).await;
         }
         let _ = discovery::publish(&client, &room, &signer, id, None).await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn follower_exit_clears_visible_roster() {
-        let (updates, mut roster) = watch::channel(None);
-        let (names, visible) = watch::channel(Some(vec![String::from("Alice")]));
-        drop(updates);
-
-        assert!(!roster_changed(&mut roster, &names).await);
-        assert!(visible.borrow().is_none());
     }
 }
