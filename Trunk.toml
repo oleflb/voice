@@ -1,0 +1,7 @@
+[build]
+target = "web/index.html"
+dist = "dist"
+locked = true
+
+[watch]
+watch = ["web", "crates/voice-core", "Cargo.toml", "Cargo.lock"]

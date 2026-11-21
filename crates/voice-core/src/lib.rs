@@ -322,3 +322,78 @@ fn fresh(at: Timestamp) -> bool {
     let now = Timestamp::now();
     at >= now - TTL && at <= now + Duration::from_secs(5)
 }
+
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    pub fn installation_key() -> String {
+        super::new_secret()
+    }
+
+    #[wasm_bindgen]
+    pub fn create_invite(name: &str) -> Result<String, JsError> {
+        super::new_invite(name).map_err(error)
+    }
+
+    #[wasm_bindgen]
+    pub fn room_name(invite: &str) -> Result<String, JsError> {
+        super::parse_invite(invite)
+            .map(|(_, name)| name.to_owned())
+            .map_err(error)
+    }
+
+    #[wasm_bindgen]
+    pub fn valid_name(name: &str) -> bool {
+        super::valid_name(name)
+    }
+
+    #[wasm_bindgen]
+    pub async fn join(
+        invite: String,
+        identity: String,
+        name: String,
+        relay: String,
+    ) -> Result<WebRoom, JsError> {
+        super::Room::join(&invite, &identity, &name, &relay)
+            .await
+            .map(WebRoom)
+            .map_err(error)
+    }
+
+    fn error(e: anyhow::Error) -> JsError {
+        JsError::new(&e.to_string())
+    }
+
+    #[wasm_bindgen]
+    pub struct WebRoom(super::Room);
+
+    #[wasm_bindgen]
+    impl WebRoom {
+        pub async fn close(&self) {
+            self.0.client.shutdown().await;
+        }
+        pub async fn announce(&self) -> Result<(), JsError> {
+            self.0.announce().await.map_err(error)
+        }
+        pub async fn query(&self) -> Result<(), JsError> {
+            self.0.query().await.map_err(error)
+        }
+        pub async fn depart(&self) -> Result<(), JsError> {
+            self.0.depart().await.map_err(error)
+        }
+        pub async fn next(&self) -> Result<String, JsError> {
+            Ok(serde_json::to_string(&self.0.next().await.map_err(error)?)?)
+        }
+        pub async fn send(&self, member: String, description: String) -> Result<(), JsError> {
+            self.0
+                .send(
+                    &serde_json::from_str(&member)?,
+                    serde_json::from_str(&description)?,
+                )
+                .await
+                .map_err(error)
+        }
+    }
+}

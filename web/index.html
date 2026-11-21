@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice</title>
+  <link data-trunk rel="rust" href="../crates/voice-core/Cargo.toml">
+  <link data-trunk rel="css" href="style.css">
+</head>
+<body><main>
+  <header><h1>Voice</h1><span id="where">Welcome</span></header>
+  <section id="profile" hidden>
+    <h2>What should people call you?</h2>
+    <form id="profile-form"><label>Display name <input id="name" required maxlength="64" autocomplete="nickname"></label><button>Save name</button></form>
+  </section>
+  <section id="lobby" hidden>
+    <div class="bar"><h2>Lobby</h2><button id="rename"></button></div>
+    <div class="columns">
+      <section><h3>Saved rooms</h3>
+        <label class="sr" for="rooms">Saved rooms</label><select id="rooms" size="6"></select>
+        <button id="copy">Copy invite</button>
+        <h3>Who’s around</h3><p id="roster" aria-live="polite">Select a room</p>
+      </section>
+      <section><h3>Add a room</h3>
+        <form id="create"><label>Room name <input name="name" required maxlength="64"></label><button>Create room</button></form>
+        <form id="import"><label>Private invite <input name="invite" required type="password" autocomplete="off"></label><button>Import invite</button></form>
+      </section>
+    </div>
+  </section>
+  <p id="status" role="status">Loading…</p>
+</main><script data-trunk type="module" src="app.js"></script></body>
+</html>

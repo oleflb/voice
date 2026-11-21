@@ -1,0 +1,28 @@
+:root { color-scheme: dark; font: 1rem/1.5 system-ui, sans-serif; color: #e6ece9; background: #101614; }
+* { box-sizing: border-box; }
+main { max-width: 60rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
+header, .bar, .actions, form { display: flex; align-items: center; gap: .65rem; flex-wrap: wrap; }
+header { border-bottom: 1px solid #42534b; margin-bottom: 1rem; }
+h1, h2, h3 { line-height: 1.2; }
+h1 { font: bold 1.5rem monospace; color: #9ce8bd; }
+h2 { margin: .6rem 0; overflow-wrap: anywhere; }
+h3 { margin: 0 0 .9rem; font-size: 1rem; }
+.bar { justify-content: space-between; margin-bottom: 1rem; }
+.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.columns > section, #profile { padding: 1rem; min-width: 0; border: 1px solid #42534b; border-radius: .4rem; }
+form { align-items: end; margin: .75rem 0; }
+label { flex: 1; min-width: 8rem; }
+input, select, button { font: inherit; color: inherit; border: 1px solid #566a5e; border-radius: .25rem; padding: .45rem .65rem; background: #1c2922; }
+input, select { width: 100%; min-width: 0; }
+input { background: #111a15; }
+button { cursor: pointer; }
+button:hover:not(:disabled), option:checked { background: #324d3c; }
+button:disabled { opacity: .55; cursor: default; }
+:focus-visible { outline: 2px solid #9ce8bd; outline-offset: 2px; }
+.actions { margin: .65rem 0; }
+ul, ol { list-style: none; padding: 0; margin: 0; overflow-wrap: anywhere; }
+li { margin-bottom: .65rem; }
+#where, #status, #roster, small { color: #b5c9bd; }
+small { display: block; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+@media (max-width: 40rem) { .columns { grid-template-columns: 1fr; } } }
