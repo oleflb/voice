@@ -10,6 +10,7 @@ edition = "2024"
 [dependencies]
 voice-core = { path = "crates/voice-core" }
 str0m = { version = "0.25", default-features = false, features = ["rust-crypto"] }
+stun-types = "2"
 anyhow = "1"
 base64 = "0.22"
 bytes = "1"
@@ -29,7 +30,7 @@ sonora = "0.3"
 sonora-agc2 = "0.3"
 sonora-simd = "0.3"
 tempfile = "3"
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 

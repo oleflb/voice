@@ -12,6 +12,7 @@ mod peer;
 #[path = "call.rs"]
 mod rtc_call;
 mod shutdown;
+mod stun;
 mod ui;
 
 use anyhow::{Result, bail};

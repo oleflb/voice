@@ -1,4 +1,7 @@
-use crate::rtc_call::{Call, Command, Status};
+use crate::{
+    rtc_call::{Call, Command, Status},
+    stun,
+};
 use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::PublicKey;
 use std::{
@@ -14,7 +17,7 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, MediaTime, Mid},
     net::{Protocol, Receive},
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
 use voice_core::{Description, Member, Message, Room};
 
 pub fn valid(text: &str) -> bool {
@@ -163,7 +166,31 @@ impl Link {
         description: Description,
     ) -> Result<()> {
         let local = self.socket.local_addr()?;
-        room.send(&member, description).await?;
+        let mut jobs = JoinSet::<Result<Option<Candidate>>>::new();
+        let publisher = room.clone();
+        let recipient = member.clone();
+        jobs.spawn(async move {
+            publisher.send(&recipient, description).await?;
+            Ok(None)
+        });
+        let (binding, request, rx) = stun::Binding::new();
+        let server =
+            std::env::var("VOICE_STUN").unwrap_or_else(|_| "stun.cloudflare.com:3478".into());
+        if !server.is_empty() && !local.ip().is_loopback() {
+            let socket = self.socket.clone();
+            let call = self.call.clone();
+            jobs.spawn(async move {
+                match stun::gather(&socket, &server, request, rx).await {
+                    Ok(candidate) => Ok(Some(candidate)),
+                    Err(e) => {
+                        call.state
+                            .lock()
+                            .log(format!("STUN unavailable ({e}); trying local routes"));
+                        Ok(None)
+                    }
+                }
+            });
+        }
         let started = Instant::now();
         let mut buffer = [0; 65536];
         let mut mute = self.call.state.lock().muted.subscribe();
@@ -195,9 +222,23 @@ impl Link {
             };
             tokio::select! {
                 _ = mute.changed() => {}
+                Some(result) = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(candidate) = result?? && let Some(added) = self.rtc.add_local_candidate(candidate) {
+                        let line = added.to_sdp_string();
+                        // A redundant route failing to publish must not close a working call.
+                        let (room, member, call) = (room.clone(), member.clone(), self.call.clone());
+                        jobs.spawn(async move {
+                            if let Err(e) = room.send(&member, Description::Ice(line)).await {
+                                call.state.lock().log(format!("ICE signaling: {e}"));
+                            }
+                            Ok(None)
+                        });
+                    }
+                }
                 cmd = commands.recv() => match cmd { Some(cmd) => self.command(cmd)?, None => break },
                 incoming = self.socket.recv_from(&mut buffer) => {
                     let (n, source) = incoming?;
+                    if binding.receive(source, &buffer[..n]) { continue; }
                     if let Ok(contents) = buffer[..n].try_into() {
                         self.rtc.handle_input(Input::Receive(Instant::now(),Receive{proto:Protocol::Udp, source,destination:local,contents}))?;
                     }
