@@ -224,3 +224,7 @@ fn update_peer(
         }
     });
 }
+
+#[cfg(test)]
+#[path = "lobby/tests.rs"]
+mod tests;

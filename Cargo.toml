@@ -34,6 +34,9 @@ tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-threa
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
+[dev-dependencies]
+nostr-relay-builder = "0.44"
+
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
 
