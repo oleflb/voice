@@ -9,6 +9,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
-nostr-sdk = "0.44"
+futures-util = "0.3"
+nostr-sdk = { version = "0.44", features = ["nip44"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["sync"] }

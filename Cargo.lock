@@ -4269,9 +4269,11 @@ name = "voice-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "nostr-sdk",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
