@@ -1,6 +1,7 @@
 use crate::{
     audio::Jitter,
     config::{Levels, Room},
+    peer::Command,
 };
 use bytes::Bytes;
 use nostr_sdk::PublicKey;
@@ -10,16 +11,8 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use str0m::Candidate;
 use tokio::sync::{mpsc, watch};
 use voice_core::Member;
-
-pub enum Command {
-    Answer(String),
-    Ice(Candidate),
-    Chat(u32, String),
-    Audio(Instant, u64, Arc<[u8]>),
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {

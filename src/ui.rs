@@ -1,7 +1,7 @@
 use crate::{
     audio::Port,
-    call::{Call, Message},
-    config::{self, Room, valid},
+    call::{Call, Status},
+    config::{Room, valid},
     lobby::Lobby,
 };
 use anyhow::{Context, Result, ensure};
@@ -124,7 +124,7 @@ struct View {
 }
 
 struct PeerRow {
-    id: iroh::EndpointId,
+    id: nostr_sdk::PublicKey,
     name: String,
     late: bool,
     muted: bool,
@@ -137,7 +137,7 @@ struct PeerRow {
 enum LevelRow {
     #[default]
     Me,
-    Peer(iroh::EndpointId),
+    Peer(nostr_sdk::PublicKey),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -278,7 +278,11 @@ impl View {
         let value = self.draft.as_ref().map_or("", |edit| edit.text.trim());
         match &self.form {
             Some(Form::Name) => {
-                ensure!(valid(value, 64), "Use a display name of 1–64 bytes");
+                ensure!(
+                    voice_core::valid_name(value),
+                    "Use a display name of 1–64 bytes"
+                );
+
                 lobby.config.name = value.to_owned();
                 if let Err(error) = lobby.config.persist() {
                     lobby.config.name.clear();
@@ -286,11 +290,7 @@ impl View {
                 }
             }
             Some(Form::RoomName) => {
-                ensure!(valid(value, 64), "Use a session name of 1–64 bytes");
-                let room = Room {
-                    name: value.to_owned(),
-                    secret: config::random(),
-                };
+                let room = Room::new(value);
                 let invite = room.invite()?;
                 self.room = lobby.add_room(room)?;
                 self.edit(Form::Share(invite));
@@ -522,8 +522,9 @@ impl View {
                 .iter()
                 .map(|(&id, p)| PeerRow {
                     id,
-                    name: p.name.clone(),
-                    late: p.is_late(),
+                    name: p.member.name.clone(),
+                    late: p.status != Status::Connected
+                        || p.seen.elapsed() >= Duration::from_secs(20),
                     muted: p.muted,
                     local_mute: p.local_mute,
                     volume: p.volume,
@@ -532,7 +533,7 @@ impl View {
                 .collect::<Vec<_>>();
             (
                 state.audio_available,
-                state.mic_off(),
+                *state.muted.borrow(),
                 state.last_speech,
                 peers,
                 state.chat.clone(),
@@ -599,7 +600,10 @@ impl View {
             );
             let messages = messages
                 .iter()
-                .map(|line| Line::from(line.as_ref()))
+                .map(|line| {
+                    let (name, text) = line.as_ref().split_at(line.own_name_len);
+                    Line::from(vec![Span::raw(name).bold(), Span::raw(text)])
+                })
                 .collect::<Vec<_>>();
             let paragraph = Paragraph::new(messages)
                 .wrap(Wrap { trim: false })
@@ -813,8 +817,7 @@ impl View {
                     {
                         let text = std::mem::take(&mut self.chat_input).text;
                         let mut state = call.state.lock();
-                        state.log(format!("{}: {text}", call.name));
-                        state.broadcast(Message::Chat(text));
+                        state.send_chat(&call.name, text);
                         self.chat_scroll = 0;
                     }
                 }
@@ -903,10 +906,8 @@ impl View {
                                         return Ok(true);
                                     }
                                     let volume = peer.volume;
-                                    state.levels.peers.insert(
-                                        nostr_sdk::PublicKey::from_byte_array(*id.as_bytes()),
-                                        volume,
-                                    );
+                                    let identity = peer.member.identity;
+                                    state.levels.peers.insert(identity, volume);
                                     true
                                 }
                             };
@@ -1047,7 +1048,6 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     #[test]
     fn edit_in_the_middle_of_unicode_text() {
@@ -1068,20 +1068,8 @@ mod tests {
 
     #[tokio::test]
     async fn two_temporary_clients_can_share_a_room_from_the_lobby() -> Result<()> {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await?;
-        let mut first = Lobby::start(
-            endpoint.clone(),
-            config::Config::open(true)?,
-            Default::default(),
-        );
-        let mut second = Lobby::start(
-            endpoint.clone(),
-            config::Config::open(true)?,
-            Default::default(),
-        );
+        let mut first = Lobby::start(crate::config::Config::open(true)?, Default::default());
+        let mut second = Lobby::start(crate::config::Config::open(true)?, Default::default());
         assert_ne!(first.config.identity, second.config.identity);
         let mut view = View {
             focus: Pane::Chat,
@@ -1133,14 +1121,12 @@ mod tests {
             view.key(KeyCode::Enter, &mut first)?;
         }
         assert!(view.focus == Pane::Chat);
-        assert!(
-            call.state
-                .lock()
-                .chat
-                .iter()
-                .map(|s| s.as_ref())
-                .eq(["Alice: jkl", "Alice: hello"])
-        );
+        assert!(call.state.lock().chat.iter().map(|s| s.as_ref()).eq([
+            "Alice: jkl",
+            "No recipients",
+            "Alice: hello",
+            "No recipients"
+        ]));
         call.state.lock().log("wrapped message ".repeat(40));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20))?;
         view.chat_scroll = u16::MAX;
@@ -1171,8 +1157,7 @@ mod tests {
         assert!(first.config.rooms.is_empty() && first.rosters.is_empty());
         assert!(first.active.borrow().is_none());
         assert_eq!(second.config.rooms.len(), 1);
-        assert!(config::Config::open(true)?.rooms.is_empty());
-        endpoint.close().await;
+        assert!(crate::config::Config::open(true)?.rooms.is_empty());
         Ok(())
     }
 }

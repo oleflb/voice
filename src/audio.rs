@@ -10,6 +10,7 @@ use maudio::{
     device::device_builder::{DeviceBuilder, DeviceBuilderOps, DuplexDeviceBuilder},
     device::device_id::DeviceId,
 };
+use nostr_sdk::PublicKey;
 use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 use sonora_agc2::vad_wrapper::VoiceActivityDetectorWrapper;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,7 @@ use std::{
 };
 
 const BLOCK: usize = 480;
-pub(crate) const FRAME: usize = BLOCK * 2;
+const FRAME: usize = BLOCK * 2;
 type Block = [f32; BLOCK];
 
 struct RunningDevice(maudio::device::Device<f32>);
@@ -352,17 +353,14 @@ impl Jitter {
 }
 
 struct MixInput {
-    id: iroh::EndpointId,
+    id: PublicKey,
     stream: Arc<()>,
     volume: Option<f32>,
     packets: Vec<(Bytes, usize)>,
     speaking: bool,
 }
 
-fn decoder_for(
-    voices: &mut BTreeMap<iroh::EndpointId, Playout>,
-    id: iroh::EndpointId,
-) -> Result<&mut Playout> {
+fn decoder_for(voices: &mut BTreeMap<PublicKey, Playout>, id: PublicKey) -> Result<&mut Playout> {
     use std::collections::btree_map::Entry;
 
     match voices.entry(id) {
@@ -540,8 +538,9 @@ pub fn run(
             frame_started = captured_at - Duration::from_millis(10);
         }
         let offset = if have_first_half { BLOCK } else { 0 };
+        let muted = *state.muted.borrow();
         for (dest, sample) in mic_frame[offset..].iter_mut().zip(clean) {
-            *dest = if state.muted {
+            *dest = if muted {
                 0.0
             } else {
                 (sample * (input / boost)).clamp(-1., 1.)
@@ -631,7 +630,10 @@ pub fn run(
         }
         // Never send buffered samples from before an unmute.
         seq += 1;
-        if state.muted || state.closed || frame_started < state.mic_changed_at {
+        if *state.muted.borrow()
+            || state.closed
+            || state.mic_changed_at.is_some_and(|t| frame_started < t)
+        {
             gate.pending.clear();
             gate.tail = 0;
             continue;
@@ -647,13 +649,14 @@ pub fn run(
             let mut packet = [0; 1200];
             let size = encoder.encode(&frame, FRAME, &mut packet)?;
             let mut state = call.state.lock();
-            if state.muted || state.closed || at < state.mic_changed_at {
+            if *state.muted.borrow() || state.closed || state.mic_changed_at.is_some_and(|t| at < t)
+            {
                 continue;
             }
             if talking {
                 state.last_speech = Some(Instant::now());
             }
-            state.send_opus(
+            state.send_audio(
                 at,
                 (first + i as u64) * FRAME as u64,
                 Arc::from(&packet[..size]),

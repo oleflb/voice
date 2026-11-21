@@ -16,7 +16,8 @@
             fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./crates ];
           };
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
+          buildInputs = [ pkgs.aws-lc ];
           postFixup = ''
             wrapProgram $out/bin/voice --prefix LD_LIBRARY_PATH : ${audioLibraries pkgs}
           '';
@@ -24,7 +25,7 @@
       });
       devShells = forLinux (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc rustfmt clippy ];
+          packages = with pkgs; [ cargo rustc rustfmt clippy cmake ];
           LD_LIBRARY_PATH = audioLibraries pkgs;
         };
       });

@@ -1,26 +1,15 @@
 mod audio;
-#[path = "legacy_call.rs"]
 mod call;
 mod config;
-mod discovery;
 mod dsp;
-#[path = "legacy_lobby.rs"]
 mod lobby;
-#[allow(dead_code)]
 mod peer;
-#[allow(dead_code)]
-#[path = "call.rs"]
-mod rtc_call;
-#[allow(dead_code)]
-#[path = "lobby.rs"]
-mod rtc_lobby;
 mod shutdown;
 mod stun;
 mod ui;
 
 use anyhow::{Result, bail};
 use config::{Config, Room};
-use iroh::{Endpoint, SecretKey, endpoint::presets};
 use std::io::{self, Write};
 
 const HELP: &str = "voice                         Open the lobby with echo cancellation and adaptive mic gain\nvoice create NAME             Save a new room and print its secret invite\nvoice import                  Paste and save a room invite\nvoice invite NAME             Print a saved room's invite\nvoice --no-echo-cancellation  Disable software echo cancellation\nvoice --no-sender-agc         Disable adaptive mic gain\n--temporary-identity          Fresh in-memory profile; no config reads or writes";
@@ -31,14 +20,6 @@ fn prompt(label: &str) -> Result<String> {
     let mut value = String::new();
     io::stdin().read_line(&mut value)?;
     Ok(value.trim().to_owned())
-}
-
-async fn endpoint(identity: [u8; 32], protocol: &[u8]) -> Result<Endpoint> {
-    Ok(Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&identity))
-        .alpns(vec![protocol.to_vec()])
-        .bind()
-        .await?)
 }
 
 enum Command<'a> {
@@ -52,7 +33,7 @@ enum Command<'a> {
 fn parse<'a>(args: &[&'a str]) -> Result<Command<'a>> {
     Ok(match args {
         ["--help" | "-h"] => Command::Help,
-        ["create" | "invite", name] if !config::valid(name, 64) => bail!("invalid room name"),
+        ["create" | "invite", name] if !voice_core::valid_name(name) => bail!("invalid room name"),
         ["create", name] => Command::Create(name),
         ["import"] => Command::Import,
         ["invite", name] => Command::Invite(name),
@@ -88,21 +69,26 @@ async fn main() -> Result<()> {
         }
         Command::Lobby(capture) => {
             let shutdown = shutdown::Shutdown::new()?;
+            let mut quitting = shutdown.subscribe();
             let config = Config::open(temporary)?;
-            let endpoint = endpoint(config.identity, call::ALPN).await?;
-            let mut lobby = lobby::Lobby::start(endpoint.clone(), config, capture);
+            let mut lobby = lobby::Lobby::start(config, capture);
+            let active = lobby.active.clone();
+            let departure = tokio::spawn(async move {
+                if quitting.wait_for(|quit| *quit).await.is_ok()
+                    && let Some(departure) = lobby::depart(&active)
+                {
+                    departure.await;
+                }
+            });
             let result = ui::run(&mut lobby, &shutdown);
             shutdown.request();
             lobby.shutdown().await;
-            endpoint.close().await;
+            departure.await?;
             result
         }
         Command::Create(name) => {
             let mut config = Config::open(temporary)?;
-            let room = Room {
-                name: name.to_owned(),
-                secret: config::random(),
-            };
+            let room = Room::new(name);
             let invite = room.invite()?;
             config.add_room(room)?;
             println!("{invite}");

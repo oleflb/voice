@@ -1,11 +1,6 @@
 use anyhow::{Context, Result, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use directories::ProjectDirs;
 use nostr_sdk::SecretKey;
-use ring::{
-    hmac,
-    rand::{SecureRandom, SystemRandom},
-};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -19,13 +14,6 @@ pub struct Room {
     pub secret: [u8; 32],
 }
 
-pub fn random<const N: usize>() -> [u8; N] {
-    let mut bytes = [0; N];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .expect("system random source");
-    bytes
-}
 pub fn valid(s: &str, max: usize) -> bool {
     !s.trim().is_empty() && s.len() <= max && !s.chars().any(char::is_control)
 }
@@ -37,21 +25,15 @@ impl Room {
             secret: SecretKey::generate().to_secret_bytes(),
         }
     }
-
-    pub fn key(&self, label: &[u8]) -> [u8; 32] {
-        hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &self.secret), label)
-            .as_ref()
-            .try_into()
-            .unwrap()
-    }
     pub fn invite(&self) -> Result<String> {
-        Ok(B64.encode(serde_json::to_vec(self)?))
+        voice_core::format_invite(&self.name, &SecretKey::from_slice(&self.secret)?)
     }
     pub fn parse(s: &str) -> Result<Self> {
-        ensure!(s.len() <= 1024, "invite too long");
-        let r: Self = serde_json::from_slice(&B64.decode(s)?)?;
-        ensure!(valid(&r.name, 64), "invalid room name");
-        Ok(r)
+        let (secret, name) = voice_core::parse_invite(s)?;
+        Ok(Self {
+            secret: secret.to_secret_bytes(),
+            name: name.to_owned(),
+        })
     }
 }
 pub const DEFAULT_PEER_VOLUME: f32 = 0.5;

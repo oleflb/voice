@@ -1,5 +1,5 @@
 use crate::{
-    rtc_call::{Call, Command, Status},
+    call::{Call, Status},
     stun,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -19,6 +19,13 @@ use str0m::{
 };
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
 use voice_core::{Description, Member, Message, Room};
+
+pub enum Command {
+    Answer(String),
+    Ice(Candidate),
+    Chat(u32, String),
+    Audio(Instant, u64, Arc<[u8]>),
+}
 
 pub fn valid(text: &str) -> bool {
     !text.trim().is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
