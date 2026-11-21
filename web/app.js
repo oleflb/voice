@@ -1,4 +1,5 @@
 import { startCall } from "./peer.js";
+import { refresh } from "./devices.js";
 
 const { create_invite, installation_key, join, room_name, valid_name } =
   window.wasmBindings ?? await new Promise(resolve =>
@@ -12,6 +13,8 @@ let current, selected, enter;
 function view(id, heading) {
   for (const panel of ["profile", "lobby", "call"]) $(panel).hidden = panel !== id;
   $("where").textContent = heading;
+  $("devices").hidden = id === "profile";
+  if (id !== "profile") refresh();
   status("");
 }
 
@@ -44,6 +47,7 @@ async function openRoom(active) {
     active = true;
     view("call", "Room");
     $("title").textContent = room_name(selected);
+    $("mic").disabled = true;
     report("Joining…");
     start();
   };

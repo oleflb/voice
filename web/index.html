@@ -7,6 +7,7 @@
   <link data-trunk rel="rust" href="../crates/voice-core/Cargo.toml">
   <link data-trunk rel="css" href="style.css">
   <link data-trunk rel="copy-file" href="peer.js">
+  <link data-trunk rel="copy-file" href="devices.js">
 </head>
 <body><main>
   <header><h1>Voice</h1><span id="where">Welcome</span></header>
@@ -29,7 +30,7 @@
     </div>
   </section>
   <section id="call" hidden>
-    <div class="bar"><h2 id="title"></h2><div class="actions"><button id="share">Copy invite</button><button id="leave">Leave</button></div></div>
+    <div class="bar"><h2 id="title"></h2><div class="actions"><button id="mic" disabled>Mute</button><button id="share">Copy invite</button><button id="leave">Leave</button></div></div>
     <div class="columns room">
       <section><h3>Participants</h3><ul id="peers"></ul></section>
       <section><h3>Chat</h3><ol id="chat" role="log" aria-label="Chat history"></ol>
@@ -37,6 +38,12 @@
       </section>
     </div>
   </section>
+  <details id="devices" hidden><summary>Audio devices</summary>
+    <div class="columns"><label>Microphone<select id="input-device"></select></label>
+      <label>Speakers<select id="output-device"></select></label></div>
+    <button id="allow-output" hidden>Choose another speaker…</button>
+    <small id="audio-info" role="status"></small>
+  </details>
   <p id="status" role="status">Loading…</p>
 </main><script data-trunk type="module" src="app.js"></script></body>
 </html>
