@@ -243,6 +243,25 @@ impl Lobby {
                 .as_ref()
                 .is_some_and(|(_, worker)| !worker.is_finished())
     }
+    pub fn select_device(&mut self, port: audio::Port, selected: Option<String>) -> Result<()> {
+        let choice = port.choice(&mut self.config.devices);
+        if *choice == selected {
+            return Ok(());
+        }
+        let old = std::mem::replace(choice, selected);
+        if let Err(e) = self.config.persist() {
+            *port.choice(&mut self.config.devices) = old;
+            return Err(e);
+        }
+        let active = self.active.borrow().clone();
+        if let Some(call) = active {
+            let mic = self.mic_requested();
+            if mic || matches!(port, audio::Port::Output) {
+                self.start_audio(call, mic)?;
+            }
+        }
+        Ok(())
+    }
     pub fn leave(&mut self) {
         if let Some(call) = self.active.send_replace(None) {
             call.close();

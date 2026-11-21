@@ -1,4 +1,5 @@
 use crate::{
+    audio::Port,
     call::{Call, Message},
     config::{self, Room, valid},
     lobby::Lobby,
@@ -135,8 +136,7 @@ struct PeerRow {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum LevelRow {
     #[default]
-    Output,
-    Input,
+    Me,
     Peer(iroh::EndpointId),
 }
 
@@ -157,6 +157,11 @@ fn direction(key: KeyCode) -> Option<bool> {
 }
 
 enum Form {
+    Devices {
+        port: Port,
+        choices: Vec<Option<String>>,
+        cursor: usize,
+    },
     Name,
     RoomName,
     Import,
@@ -168,6 +173,7 @@ enum Form {
 impl Form {
     fn title(&self) -> &str {
         match self {
+            Self::Devices { port, .. } => port.label(),
             Self::Name => "Welcome! Enter your display name",
             Self::RoomName => "New session: enter a name",
             Self::Import => "Paste a private room invite",
@@ -202,6 +208,29 @@ fn panel(title: &str) -> Block<'static> {
             format!(" {title} "),
             Style::new().cyan().bold(),
         ))
+}
+
+fn adjust_global(lobby: &mut Lobby, port: Port, up: bool) -> Result<()> {
+    fn level(port: Port, levels: &mut crate::config::Levels) -> &mut f32 {
+        match port {
+            Port::Input => &mut levels.input,
+            Port::Output => &mut levels.output,
+        }
+    }
+    let saved = level(port, &mut lobby.config.levels);
+    let previous = *saved;
+    if !adjust(saved, up, 4.0) {
+        return Ok(());
+    }
+    let value = *saved;
+    if let Err(error) = lobby.config.persist() {
+        *level(port, &mut lobby.config.levels) = previous;
+        return Err(error);
+    }
+    if let Some(call) = lobby.active.borrow().as_ref() {
+        *level(port, &mut call.state.lock().levels) = value;
+    }
+    Ok(())
 }
 
 impl View {
@@ -239,7 +268,7 @@ impl View {
         self.draft = match form {
             Form::Name | Form::RoomName => Some(TextEdit::new(64)),
             Form::Import => Some(TextEdit::default()),
-            Form::Share(_) | Form::Delete | Form::Leave => None,
+            Form::Share(_) | Form::Delete | Form::Leave | Form::Devices { .. } => None,
         };
         self.form = Some(form);
         self.notice.clear();
@@ -270,7 +299,7 @@ impl View {
             Some(Form::Import) => {
                 self.room = lobby.add_room(Room::parse(value).context("Invalid room invite")?)?;
             }
-            Some(Form::Share(_) | Form::Delete | Form::Leave) => {}
+            Some(Form::Share(_) | Form::Delete | Form::Leave | Form::Devices { .. }) => {}
             None => {}
         }
         self.form = None;
@@ -325,6 +354,44 @@ impl View {
 
     fn draw(&mut self, frame: &mut ratatui::Frame, lobby: &Lobby) {
         self.draw_view(frame, lobby);
+        if let Some(
+            form @ Form::Devices {
+                choices,
+                cursor,
+                port,
+            },
+        ) = &self.form
+        {
+            let area = frame.area();
+            let width = area.width.min(64);
+            let height = area
+                .height
+                .saturating_sub(1)
+                .min((choices.len().min(12) + 5) as u16);
+            let popup = Rect::new(area.x, area.y.saturating_add(1), width, height);
+            let offset = cursor.saturating_sub(popup.height.saturating_sub(6) as usize);
+            let list = choices.iter().enumerate().skip(offset).map(|(i, name)| {
+                let name = name.as_deref().unwrap_or("System default");
+                if i == *cursor {
+                    Line::from(format!("› {name}")).cyan()
+                } else {
+                    Line::from(format!("  {name}"))
+                }
+            });
+            let (label, level) = match port {
+                Port::Input => ("Input gain", lobby.config.levels.input),
+                Port::Output => ("Output volume", lobby.config.levels.output),
+            };
+            let mut lines = vec![
+                Line::from(format!("{label}: {:.0}%  ·  +/- adjust", level * 100.0)),
+                Line::from("↑↓ select device · Enter apply device · Esc close"),
+                Line::from(self.notice.clone()),
+            ];
+            lines.extend(list);
+            frame.render_widget(ratatui::widgets::Clear, popup);
+            frame.render_widget(Paragraph::new(lines).block(panel(form.title())), popup);
+        }
+
         if let Some(form @ (Form::Delete | Form::Leave)) = &self.form {
             let content = if matches!(form, Form::Delete) {
                 let room = &lobby.config.rooms[self.room];
@@ -375,11 +442,12 @@ impl View {
             Line::from(vec![
                 " ◉ VOICE ".black().on_cyan().bold(),
                 Span::raw(format!("  {profile}")).dark_gray(),
+                Span::raw("   F2 microphone · F3 speakers").dark_gray(),
             ]),
             header,
         );
         if let Some(form) = &self.form
-            && !matches!(form, Form::Delete | Form::Leave)
+            && !matches!(form, Form::Delete | Form::Leave | Form::Devices { .. })
         {
             let (text, help) = match form {
                 Form::Share(invite) => (invite.as_str(), "c copy to clipboard · Esc close"),
@@ -447,7 +515,7 @@ impl View {
             Constraint::Length(4),
         ])
         .areas(body);
-        let (audio_available, muted, speech, master, gain, peers, messages) = {
+        let (audio_available, muted, speech, peers, messages) = {
             let state = call.state.lock();
             let peers = state
                 .peers
@@ -466,20 +534,15 @@ impl View {
                 state.audio_available,
                 state.mic_off(),
                 state.last_speech,
-                state.levels.output,
-                state.levels.input,
                 peers,
                 state.chat.clone(),
             )
         };
         draw_rooms(frame, rooms, Some((&call, &peers)));
         {
-            let mut lines = Vec::new();
-            if audio_available {
-                self.level_rows.extend([LevelRow::Output, LevelRow::Input]);
-                lines.push(Line::from(format!("Output {:.0}%", master * 100.0)));
-                lines.push(Line::from(format!("Input {:.0}%", gain * 100.0)));
-            }
+            self.level_rows.push(LevelRow::Me);
+            let mut lines =
+                vec![Line::from(format!("{} {}", call.name, indicator(muted, speech))).bold()];
             for peer in &peers {
                 self.level_rows.push(LevelRow::Peer(peer.id));
                 let local = if peer.local_mute {
@@ -609,13 +672,67 @@ impl View {
         if !(event.modifiers - KeyModifiers::SHIFT).is_empty() {
             return Ok(true);
         }
+        if let Some(Form::Devices {
+            port,
+            choices,
+            cursor,
+        }) = &mut self.form
+        {
+            match key {
+                KeyCode::Char(ch @ ('+' | '-')) => {
+                    if let Err(error) = adjust_global(lobby, *port, ch == '+') {
+                        self.notice = format!("Could not save level: {error}");
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *cursor = (*cursor + 1).min(choices.len() - 1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+                KeyCode::Esc => self.form = None,
+                KeyCode::Enter => match lobby.select_device(*port, choices[*cursor].clone()) {
+                    Ok(()) => self.form = None,
+                    Err(e) => self.notice = e.to_string(),
+                },
+                _ => {}
+            }
+            return Ok(true);
+        }
+        if self.form.is_none() && matches!(key, KeyCode::F(2 | 3)) {
+            let port = if key == KeyCode::F(2) {
+                Port::Input
+            } else {
+                Port::Output
+            };
+            let mut choices = vec![None];
+            let mut notice = String::new();
+            match port.names() {
+                Ok(names) => choices.extend(names.into_iter().map(Some)),
+                Err(e) => notice = e.to_string(),
+            }
+            let saved = port.choice(&mut lobby.config.devices);
+            let cursor = choices
+                .iter()
+                .position(|entry| entry == saved)
+                .unwrap_or_else(|| {
+                    notice = format!("Saved {} unavailable", port.label());
+                    choices.push(saved.clone());
+                    choices.len() - 1
+                });
+            self.edit(Form::Devices {
+                port,
+                choices,
+                cursor,
+            });
+            self.notice = notice;
+            return Ok(true);
+        }
         if matches!(self.form, Some(Form::Delete)) {
             match key {
                 KeyCode::Char('y') => match lobby.remove_room(self.room) {
                     Ok(()) => {
                         self.room = self.room.min(lobby.config.rooms.len().saturating_sub(1));
                         if lobby.active.borrow().is_none() {
-                            self.selected = LevelRow::Output;
+                            self.selected = LevelRow::Me;
                             self.chat_input = TextEdit::default();
                             self.chat_scroll = 0;
                         }
@@ -741,7 +858,7 @@ impl View {
             }
             KeyCode::Enter if self.focus == Pane::Sessions => {
                 if lobby.join(self.room)? {
-                    self.selected = LevelRow::Output;
+                    self.selected = LevelRow::Me;
                     self.chat_input = TextEdit::default();
                     self.chat_scroll = 0;
                 }
@@ -777,8 +894,7 @@ impl View {
                         KeyCode::Char(ch @ ('+' | '-')) if self.focus == Pane::People => {
                             let up = ch == '+';
                             let changed = match self.selected {
-                                LevelRow::Output => adjust(&mut state.levels.output, up, 4.0),
-                                LevelRow::Input => adjust(&mut state.levels.input, up, 4.0),
+                                LevelRow::Me => return Ok(true),
                                 LevelRow::Peer(id) => {
                                     let Some(peer) = state.peers.get_mut(&id) else {
                                         return Ok(true);
@@ -967,7 +1083,7 @@ mod tests {
         let mut view = View {
             focus: Pane::Chat,
             level_area: Rect::new(1, 1, 10, 1),
-            level_rows: vec![LevelRow::Input],
+            level_rows: vec![LevelRow::Me],
             ..Default::default()
         };
         view.point_at_level(1, 1, false);

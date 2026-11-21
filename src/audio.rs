@@ -51,6 +51,12 @@ impl Port {
             Self::Output => "Speakers",
         }
     }
+    pub fn choice(self, devices: &mut DeviceChoices) -> &mut Option<String> {
+        match self {
+            Self::Input => &mut devices.input,
+            Self::Output => &mut devices.output,
+        }
+    }
     fn devices(self, context: &Context) -> Result<Vec<(String, DeviceId)>> {
         let mut list = Vec::new();
         context.with_devices(|outputs, inputs| {
@@ -65,6 +71,13 @@ impl Port {
             );
         })?;
         Ok(list)
+    }
+    pub fn names(self) -> Result<Vec<String>> {
+        Ok(self
+            .devices(&device_context()?)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
     fn resolve(self, context: &Context, name: Option<&str>) -> Result<Option<DeviceId>> {
         let Some(name) = name else { return Ok(None) };
@@ -451,6 +464,25 @@ pub fn run(
     let notifications = device.get_state_notifier();
     let _device = RunningDevice(device);
     let mut last_callback = Instant::now();
+    // Some backends move a disconnected stream without notifying us. Enumerating
+    // devices may block, so check pinned routes outside the processing thread.
+    let (_watch, cancel) = std::sync::mpsc::channel::<()>();
+    let mut monitor =
+        (devices.output.is_some() || (mic_enabled && devices.input.is_some())).then(|| {
+            let devices = devices.clone();
+            thread::spawn(move || -> Result<()> {
+                while matches!(
+                    cancel.recv_timeout(Duration::from_secs(2)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if mic_enabled {
+                        Port::Input.resolve(&context, devices.input.as_deref())?;
+                    }
+                    Port::Output.resolve(&context, devices.output.as_deref())?;
+                }
+                Ok(())
+            })
+        });
     {
         let mut state = call.state.lock();
         state.audio_available = true;
@@ -468,6 +500,11 @@ pub fn run(
                 || (mic_enabled && devices.input.is_some() && n.rerouted())),
             "Audio device disconnected or rerouted"
         );
+        if let Some(job) = monitor.take_if(|job| job.is_finished()) {
+            return job
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Device monitor stopped")));
+        }
         let Some((captured_at, mic, render)) = capture.pop() else {
             ensure!(
                 last_callback.elapsed() < Duration::from_secs(3),
