@@ -1,5 +1,6 @@
 use crate::{
-    config::Room,
+    audio,
+    config::{Config, Room},
     peer,
     rtc_call::{Call, Command, Peer, Status},
 };
@@ -13,9 +14,113 @@ use std::{
 };
 use tokio::{
     sync::{mpsc, watch},
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
 };
 use voice_core::{Description, Member, Update};
+
+pub struct Lobby {
+    pub config: Config,
+    pub rosters: Vec<watch::Receiver<Option<Vec<String>>>>,
+    pub active: watch::Sender<Option<Arc<Call>>>,
+    watchers: Vec<JoinHandle<()>>,
+    departures: JoinSet<()>,
+}
+
+impl Lobby {
+    pub fn start(config: Config, _capture: audio::CaptureOptions) -> Self {
+        let mut lobby = Self {
+            config,
+            active: watch::channel(None).0,
+            rosters: vec![],
+            watchers: vec![],
+            departures: JoinSet::new(),
+        };
+        for room in lobby.config.rooms.clone() {
+            lobby.watch(room);
+        }
+        lobby
+    }
+
+    fn watch(&mut self, room: Room) {
+        let (roster, rx) = watch::channel(None);
+        self.rosters.push(rx);
+        let mut active = self.active.subscribe();
+        let identity = self.config.identity;
+        self.watchers.push(tokio::spawn(async move {
+            let relay = std::env::var("VOICE_RELAY").unwrap_or_default();
+            loop {
+                if let Err(e) =
+                    room_session(&room, identity, &relay, interface, &mut active, &roster).await
+                {
+                    roster.send_replace(None);
+                    if let Some(call) = active
+                        .borrow()
+                        .as_ref()
+                        .filter(|c| c.room.secret == room.secret)
+                    {
+                        call.state.lock().log(format!("Room signaling: {e}"));
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        changed = active.changed() => if changed.is_err() { break; }
+                    }
+                }
+            }
+        }));
+    }
+    pub fn add_room(&mut self, room: Room) -> Result<usize> {
+        let index = self.config.rooms.len();
+        self.config.add_room(room.clone())?;
+        self.watch(room);
+        Ok(index)
+    }
+    pub fn remove_room(&mut self, index: usize) -> Result<()> {
+        let room = self.config.remove_room(index)?;
+        if self
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.room.secret == room.secret)
+        {
+            self.leave();
+        }
+        self.watchers.remove(index).abort();
+        self.rosters.remove(index);
+        Ok(())
+    }
+    pub fn join(&mut self, index: usize) -> Result<bool> {
+        let Some(room) = self.config.rooms.get(index) else {
+            return Ok(false);
+        };
+        if self
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.room.secret == room.secret)
+        {
+            return Ok(false);
+        }
+        let call = Call::new(room.clone(), self.config.name.clone());
+        call.state.lock().levels = self.config.levels.clone();
+        self.leave();
+        self.active.send_replace(Some(call.clone()));
+        Ok(true)
+    }
+    pub fn leave(&mut self) {
+        if let Some(departure) = depart(&self.active) {
+            self.departures.spawn(departure);
+            while self.departures.try_join_next().is_some() {}
+        }
+    }
+    pub async fn shutdown(mut self) {
+        self.leave();
+        while self.departures.join_next().await.is_some() {}
+        for watcher in self.watchers {
+            watcher.abort();
+            let _ = watcher.await;
+        }
+    }
+}
 
 pub fn depart(
     active: &watch::Sender<Option<Arc<Call>>>,
