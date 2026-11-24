@@ -1,3 +1,4 @@
+use crate::network::{Interface, interfaces};
 use crate::{
     audio,
     call::{Call, Peer, Status},
@@ -8,7 +9,6 @@ use anyhow::{Context, Result};
 use nostr_sdk::SecretKey;
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,7 +20,7 @@ use tokio::{
     sync::{mpsc, watch},
     task::{JoinHandle, JoinSet},
 };
-use voice_core::{Description, Member, Update};
+use voice_core::{Description, Member, Signal, Update};
 
 pub struct Lobby {
     pub config: Config,
@@ -60,7 +60,7 @@ impl Lobby {
             let relay = std::env::var("VOICE_RELAY").unwrap_or_default();
             loop {
                 if let Err(e) =
-                    room_session(&room, identity, &relay, interface, &mut active, &roster).await
+                    room_session(&room, identity, &relay, interfaces, &mut active, &roster).await
                 {
                     roster.send_replace(None);
                     if let Some(call) = active
@@ -220,23 +220,11 @@ pub fn depart(
     })
 }
 
-fn interface() -> Result<IpAddr> {
-    if let Ok(ip) = std::env::var("VOICE_BIND_IP") {
-        return Ok(ip.parse()?);
-    }
-    // UDP connect selects the default route without sending a datagram.
-    let probe = UdpSocket::bind("0.0.0.0:0")?;
-    probe
-        .connect("192.0.2.1:9")
-        .context("No default IPv4 route; set VOICE_BIND_IP")?;
-    Ok(probe.local_addr()?.ip())
-}
-
 async fn room_session(
     saved: &Room,
     identity: [u8; 32],
     relay: &str,
-    bind_ip: fn() -> Result<IpAddr>,
+    bind_ips: fn() -> Result<Vec<Interface>>,
     active: &mut watch::Receiver<Option<Arc<Call>>>,
     roster: &watch::Sender<Option<Vec<String>>>,
 ) -> Result<()> {
@@ -252,7 +240,8 @@ async fn room_session(
     let mut jobs = JoinSet::new();
     let mut names = BTreeMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
-    let mut listening = true;
+    let (network, _) = watch::channel(Vec::new());
+    let mut previous = Vec::new();
     let mut call = None;
     let mut first = true;
     loop {
@@ -268,6 +257,8 @@ async fn room_session(
         if call.is_none()
             && let Some(c) = wanted
         {
+            previous = bind_ips()?;
+            network.send_replace(previous.clone());
             room.set_name(&c.name)?;
             {
                 let mut state = c.state.lock();
@@ -299,18 +290,26 @@ async fn room_session(
                 names.retain(|_, (_, at): &mut (String, Instant)| at.elapsed() < Duration::from_secs(35));
                 roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
                 if let Some(c) = &call {
+                    if let Ok(current) = bind_ips() {
+                        network.send_modify(|published| {
+                            // Retire vanished paths immediately; debounce additions while a fallback exists.
+                            let has_route = published.iter().any(|i| current.contains(i));
+                            // Republish stable snapshots too, so a temporarily unbindable NIC gets retried.
+                            *published = current.iter().filter(|i| !has_route || previous.contains(i)).cloned().collect();
+                        });
+                        previous = current;
+                    }
                     c.state.lock().peers.retain(|_, p| p.status == Status::Connected || p.seen.elapsed() < Duration::from_secs(35));
                 }
             }
-            update = room.next(), if listening => {
+            update = room.next() => {
                 let (member, update) = match update {
                     Ok(event) => event,
-                    Err(e) if let Some(c) = &call => {
-                        c.state.lock().log(format!("Room signaling stopped: {e}"));
-                        listening = false;
-                        continue;
+                    Err(e) => {
+                        // The relay SDK handles transient disconnects; a closed receiver needs a fresh session.
+                        if let Some(c) = &call { c.state.lock().peers.clear(); }
+                        return Err(e);
                     }
-                    Err(e) => return Err(e),
                 };
                 if matches!(update, Update::Query) {
                     if call.is_some() {
@@ -327,7 +326,7 @@ async fn room_session(
                 }
                 roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
                 if matches!(update, Update::Left) { continue; }
-                if let Some(c) = &call { update_peer(c, &room, member, update, bind_ip, &mut jobs); }
+                if let Some(c) = &call { update_peer(c, &room, member, update, &network, &mut jobs); }
             }
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {}
         }
@@ -339,7 +338,7 @@ fn update_peer(
     room: &Arc<voice_core::Room>,
     member: Member,
     update: Update,
-    bind_ip: fn() -> Result<IpAddr>,
+    network: &watch::Sender<Vec<Interface>>,
     jobs: &mut JoinSet<()>,
 ) {
     let mut state = call.state.lock();
@@ -366,43 +365,106 @@ fn update_peer(
     if matches!(update, Update::Presence { .. }) {
         p.seen = Instant::now();
     }
-    let offer = match update {
-        Update::Presence { dial: true } => None,
-        Update::Signal(Description::Offer(sdp)) => Some(sdp),
-        Update::Signal(Description::Answer(sdp)) => {
-            if let Some(tx) = &p.control {
-                let _ = tx.try_send(Command::Answer(sdp));
+    let now = Instant::now();
+    // Remain newer than delayed offers even if a long outage expired the roster entry.
+    let next_attempt = p
+        .attempt
+        .saturating_add(1)
+        .max(u32::try_from(call.started.elapsed().as_secs()).unwrap_or(u32::MAX));
+    let offer = match &update {
+        Update::Presence { dial } => {
+            if p.control.is_some() || now < p.next_retry {
+                return;
             }
-            return;
-        }
-        Update::Signal(Description::Ice(line)) => {
-            if let Ok(candidate) = str0m::Candidate::from_sdp_string(&line) {
-                if let Some(tx) = &p.control {
-                    let _ = tx.try_send(Command::Ice(candidate));
-                } else if p.status == Status::Present && p.early_ice.len() < 32 {
-                    p.early_ice.push(candidate);
+            if !dial {
+                if p.status != Status::Present {
+                    let (room, member, attempt) = (room.clone(), member.clone(), p.attempt);
+                    jobs.spawn(async move {
+                        let _ = room
+                            .send(&member, Signal::new(attempt, Description::Reconnect))
+                            .await;
+                    });
+                    p.next_retry = now + Duration::from_secs(8);
                 }
+                return;
             }
-            return;
+            if p.status != Status::Present {
+                p.attempt = next_attempt;
+            }
+            None
+        }
+        Update::Signal(signal) => {
+            let (attempt, signal) = signal.parts();
+            match signal {
+                Description::Offer(sdp)
+                    if attempt > p.attempt
+                        || (attempt == p.attempt && p.status == Status::Present) =>
+                {
+                    p.attempt = attempt;
+                    Some(sdp.clone())
+                }
+                Description::Reconnect if attempt == p.attempt && now >= p.next_retry => {
+                    p.attempt = next_attempt;
+                    None
+                }
+                Description::Answer(sdp) if attempt == p.attempt => {
+                    if let Some(tx) = &p.control {
+                        let _ = tx.try_send(Command::Answer(sdp.clone()));
+                    }
+                    return;
+                }
+                Description::Ice(line) if attempt >= p.attempt => {
+                    if let Ok(candidate) = str0m::Candidate::from_sdp_string(line) {
+                        if attempt == p.attempt
+                            && let Some(tx) = &p.control
+                        {
+                            let _ = tx.try_send(Command::Ice(candidate));
+                        } else if p.early_ice.len() < 32 {
+                            p.early_ice.push((attempt, candidate));
+                        }
+                    }
+                    return;
+                }
+                Description::Remove(line) if attempt == p.attempt => {
+                    if let Ok(candidate) = str0m::Candidate::from_sdp_string(line)
+                        && let Some(tx) = &p.control
+                    {
+                        let _ = tx.try_send(Command::Remove(candidate));
+                    }
+                    return;
+                }
+                _ => return,
+            }
         }
         _ => return,
     };
-    if p.status != Status::Present {
-        return;
-    }
+    let attempt = p.attempt;
+    p.selected_ip = None;
+    p.packets.clear();
+    p.audio_stream = Arc::new(());
+    p.jitter = Default::default();
     let (tx, rx) = mpsc::channel(64);
-    for candidate in p.early_ice.drain(..) {
-        let _ = tx.try_send(Command::Ice(candidate));
+    for (id, candidate) in p.early_ice.drain(..) {
+        if id == attempt {
+            let _ = tx.try_send(Command::Ice(candidate));
+        }
     }
+    let owner = tx.downgrade();
     p.control = Some(tx);
     p.status = Status::Connecting;
     let call = call.clone();
     let room = room.clone();
+    let network = network.subscribe();
     jobs.spawn(async move {
-        let result =
-            async { peer::connect(bind_ip()?, room, member, offer, call.clone(), rx).await }.await;
+        let result = peer::connect(network, room, member, offer, attempt, call.clone(), rx).await;
         let mut state = call.state.lock();
-        if let Some(p) = state.peers.get_mut(&id) {
+        if let Some(p) = state.peers.get_mut(&id)
+            && p.control
+                .as_ref()
+                .is_some_and(|tx| owner.upgrade().is_some_and(|owned| tx.same_channel(&owned)))
+        {
+            p.next_retry = Instant::now() + Duration::from_secs(1 << p.failures.min(5));
+            p.failures = p.failures.saturating_add(1);
             p.status = if result.is_ok() {
                 Status::Disconnected
             } else {

@@ -62,15 +62,42 @@ pub enum Description {
     Offer(String),
     Answer(String),
     Ice(String),
+    Remove(String),
+    Reconnect,
 }
 
 impl Description {
     fn valid(&self) -> bool {
         match self {
+            Self::Reconnect => true,
             Self::Offer(s) | Self::Answer(s) => s.len() <= MAX_SDP,
-            Self::Ice(s) => {
+            Self::Ice(s) | Self::Remove(s) => {
                 s.len() <= 2048 && s.starts_with("candidate:") && !s.chars().any(char::is_control)
             }
+        }
+    }
+}
+
+// Keep first-attempt messages compatible with clients predating reconnection.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Signal {
+    Retry { attempt: u32, signal: Description },
+    First(Description),
+}
+
+impl Signal {
+    pub fn new(attempt: u32, signal: Description) -> Self {
+        if attempt == 0 {
+            Self::First(signal)
+        } else {
+            Self::Retry { attempt, signal }
+        }
+    }
+    pub fn parts(&self) -> (u32, &Description) {
+        match self {
+            Self::First(s) => (0, s),
+            Self::Retry { attempt, signal } => (*attempt, signal),
         }
     }
 }
@@ -88,7 +115,7 @@ pub enum Update {
     Query,
     Left,
     Presence { dial: bool },
-    Signal(Description),
+    Signal(Signal),
 }
 
 pub struct Room {
@@ -212,8 +239,8 @@ impl Room {
         anyhow::bail!("No relay accepted signaling")
     }
 
-    pub async fn send(&self, to: &Member, description: Description) -> Result<()> {
-        ensure!(description.valid(), "Invalid signaling payload");
+    pub async fn send(&self, to: &Member, description: Signal) -> Result<()> {
+        ensure!(description.parts().1.valid(), "Invalid signaling payload");
         let clear = serde_json::to_vec(&(self.ticket()?, to.identity, description))?;
         let sealed = nip44::encrypt(
             self.session.secret_key(),
@@ -225,7 +252,7 @@ impl Room {
             .await
     }
 
-    fn open(&self, event: &Event) -> Option<(Member, Description)> {
+    fn open(&self, event: &Event) -> Option<(Member, Signal)> {
         if event.kind != SIGNAL
             || !event
                 .tags
@@ -236,12 +263,12 @@ impl Room {
         }
         let clear =
             nip44::decrypt(self.session.secret_key(), &event.pubkey, &event.content).ok()?;
-        let (ticket, recipient, desc): (String, PublicKey, Description) =
+        let (ticket, recipient, desc): (String, PublicKey, Signal) =
             serde_json::from_str(&clear).ok()?;
         if recipient != self.identity.public_key() {
             return None;
         }
-        if !desc.valid() {
+        if !desc.parts().1.valid() {
             return None;
         }
         Some((self.member(&ticket, event.pubkey)?, desc))
@@ -278,9 +305,9 @@ impl Room {
                         return Ok((member, update));
                     }
                     if let Some((member, description)) = self.open(&event)
-                        && match description {
-                            Description::Ice(_) => true,
-                            Description::Answer(_) => dial,
+                        && match description.parts().1 {
+                            Description::Ice(_) | Description::Remove(_) => true,
+                            Description::Answer(_) | Description::Reconnect => dial,
                             Description::Offer(_) => !dial,
                         }
                     {

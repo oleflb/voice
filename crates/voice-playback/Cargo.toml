@@ -1,0 +1,12 @@
+[package]
+name = "voice-playback"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+sonora-agc2 = "0.3"
+sonora-simd = "0.3"

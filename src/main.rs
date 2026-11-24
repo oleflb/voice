@@ -3,6 +3,7 @@ mod call;
 mod config;
 mod dsp;
 mod lobby;
+mod network;
 mod peer;
 mod shutdown;
 mod stun;
