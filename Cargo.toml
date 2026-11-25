@@ -36,7 +36,7 @@ nostr-relay-builder = "0.44"
 
 [target.'cfg(unix)'.dependencies]
 base64 = "0.22"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+ratatui-image = { version = "11.1.0", default-features = false }
 rustix = { version = "1", features = ["event", "shm"] }
 signal-hook = "0.3"
 
