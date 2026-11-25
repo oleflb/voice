@@ -20,7 +20,7 @@ use tokio::{
     sync::{mpsc, watch},
     task::{JoinHandle, JoinSet},
 };
-use voice_core::{Description, Member, Update};
+use voice_core::{Description, Member, Signal, Update};
 
 pub struct Lobby {
     pub config: Config,
@@ -366,43 +366,105 @@ fn update_peer(
     if matches!(update, Update::Presence { .. }) {
         p.seen = Instant::now();
     }
-    let offer = match update {
-        Update::Presence { dial: true } => None,
-        Update::Signal(Description::Offer(sdp)) => Some(sdp),
-        Update::Signal(Description::Answer(sdp)) => {
-            if let Some(tx) = &p.control {
-                let _ = tx.try_send(Command::Answer(sdp));
+    let now = Instant::now();
+    // Remain newer than delayed offers even if a long outage expired the roster entry.
+    let next_attempt = p
+        .attempt
+        .saturating_add(1)
+        .max(u32::try_from(call.started.elapsed().as_secs()).unwrap_or(u32::MAX));
+    let offer = match &update {
+        Update::Presence { dial } => {
+            if p.control.is_some() || now < p.next_retry {
+                return;
             }
-            return;
-        }
-        Update::Signal(Description::Ice(line)) => {
-            if let Ok(candidate) = str0m::Candidate::from_sdp_string(&line) {
-                if let Some(tx) = &p.control {
-                    let _ = tx.try_send(Command::Ice(candidate));
-                } else if p.status == Status::Present && p.early_ice.len() < 32 {
-                    p.early_ice.push(candidate);
+            if !dial {
+                if p.status != Status::Present {
+                    let (room, member, attempt) = (room.clone(), member.clone(), p.attempt);
+                    jobs.spawn(async move {
+                        let _ = room
+                            .send(&member, Signal::new(attempt, Description::Reconnect))
+                            .await;
+                    });
+                    p.next_retry = now + Duration::from_secs(8);
                 }
+                return;
             }
-            return;
+            if p.status != Status::Present {
+                p.attempt = next_attempt;
+            }
+            None
+        }
+        Update::Signal(signal) => {
+            let (attempt, signal) = signal.parts();
+            match signal {
+                Description::Offer(sdp)
+                    if attempt > p.attempt
+                        || (attempt == p.attempt && p.status == Status::Present) =>
+                {
+                    p.attempt = attempt;
+                    Some(sdp.clone())
+                }
+                Description::Reconnect if attempt == p.attempt && now >= p.next_retry => {
+                    p.attempt = next_attempt;
+                    None
+                }
+                Description::Answer(sdp) if attempt == p.attempt => {
+                    if let Some(tx) = &p.control {
+                        let _ = tx.try_send(Command::Answer(sdp.clone()));
+                    }
+                    return;
+                }
+                Description::Ice(line) if attempt >= p.attempt => {
+                    if let Ok(candidate) = str0m::Candidate::from_sdp_string(line) {
+                        if attempt == p.attempt
+                            && let Some(tx) = &p.control
+                        {
+                            let _ = tx.try_send(Command::Ice(candidate));
+                        } else if p.early_ice.len() < 32 {
+                            p.early_ice.push((attempt, candidate));
+                        }
+                    }
+                    return;
+                }
+                Description::Remove(line) if attempt == p.attempt => {
+                    if let Ok(candidate) = str0m::Candidate::from_sdp_string(line)
+                        && let Some(tx) = &p.control
+                    {
+                        let _ = tx.try_send(Command::Remove(candidate));
+                    }
+                    return;
+                }
+                _ => return,
+            }
         }
         _ => return,
     };
-    if p.status != Status::Present {
-        return;
-    }
+    let attempt = p.attempt;
+    p.selected_ip = None;
+    p.packets.clear();
+    p.audio_stream = Arc::new(());
+    p.jitter = Default::default();
     let (tx, rx) = mpsc::channel(64);
-    for candidate in p.early_ice.drain(..) {
-        let _ = tx.try_send(Command::Ice(candidate));
+    for (id, candidate) in p.early_ice.drain(..) {
+        if id == attempt {
+            let _ = tx.try_send(Command::Ice(candidate));
+        }
     }
+    let owner = tx.downgrade();
     p.control = Some(tx);
     p.status = Status::Connecting;
     let call = call.clone();
     let room = room.clone();
     jobs.spawn(async move {
-        let result =
-            async { peer::connect(bind_ip()?, room, member, offer, call.clone(), rx).await }.await;
+        let result = async { peer::connect(bind_ip()?, room, member, offer, attempt, call.clone(), rx).await }.await;
         let mut state = call.state.lock();
-        if let Some(p) = state.peers.get_mut(&id) {
+        if let Some(p) = state.peers.get_mut(&id)
+            && p.control
+                .as_ref()
+                .is_some_and(|tx| owner.upgrade().is_some_and(|owned| tx.same_channel(&owned)))
+        {
+            p.next_retry = Instant::now() + Duration::from_secs(1 << p.failures.min(5));
+            p.failures = p.failures.saturating_add(1);
             p.status = if result.is_ok() {
                 Status::Disconnected
             } else {

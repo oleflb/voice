@@ -18,11 +18,12 @@ use str0m::{
     net::{Protocol, Receive},
 };
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
-use voice_core::{Description, Member, Message, Room};
+use voice_core::{Description, Member, Message, Room, Signal};
 
 pub enum Command {
     Answer(String),
     Ice(Candidate),
+    Remove(Candidate),
     Chat(u32, String),
     Audio(Instant, u64, Arc<[u8]>),
 }
@@ -40,6 +41,7 @@ struct Link {
     audio: Option<Mid>,
     call: Arc<Call>,
     session: PublicKey,
+    attempt: u32,
     pending: BTreeSet<u32>,
     name: String,
 }
@@ -55,6 +57,7 @@ impl Link {
 
     fn command(&mut self, command: Command) -> Result<()> {
         match command {
+            Command::Remove(candidate) => { self.rtc.direct_api().invalidate_candidate(&candidate); }
             Command::Answer(sdp) => {
                 if let Some(offer) = self.offer.take() {
                     self.rtc
@@ -117,6 +120,7 @@ impl Link {
             Event::MediaAdded(m) if m.kind == MediaKind::Audio => self.audio = Some(m.mid),
             Event::MediaData(m) if self.audio == Some(m.mid) => {
                 if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
+                    && p.attempt == self.attempt
                     && !p.muted
                 {
                     p.packets
@@ -128,8 +132,11 @@ impl Link {
             }
             Event::ChannelOpen(id, name) if name == "voice" && self.channel.is_none() => {
                 self.channel = Some(id);
-                if let Some(p) = self.call.state.lock().peers.get_mut(&self.session) {
+                if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
+                    && p.attempt == self.attempt
+                {
                     p.status = Status::Connected;
+                    p.failures = 0;
                 }
             }
             Event::ChannelClose(id) if self.channel == Some(id) => self.rtc.disconnect(),
@@ -139,6 +146,16 @@ impl Link {
             Event::ChannelData(d)
                 if self.channel == Some(d.id) && !d.binary && d.data.len() <= 16384 =>
             {
+                if !self
+                    .call
+                    .state
+                    .lock()
+                    .peers
+                    .get(&self.session)
+                    .is_some_and(|p| p.attempt == self.attempt)
+                {
+                    return Ok(());
+                }
                 match serde_json::from_slice(&d.data) {
                     Ok(Message::Chat { id, text }) if valid(&text) => {
                         self.call.state.lock().log(format!("{}: {text}", self.name));
@@ -150,7 +167,9 @@ impl Link {
                         .lock()
                         .log(format!("{}: delivered #{id}", self.name)),
                     Ok(Message::Mute { muted }) => {
-                        if let Some(p) = self.call.state.lock().peers.get_mut(&self.session) {
+                        if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
+                            && p.attempt == self.attempt
+                        {
                             p.muted = muted;
                             p.audio_stream = Arc::new(());
                             p.packets.clear();
@@ -174,10 +193,11 @@ impl Link {
     ) -> Result<()> {
         let local = self.socket.local_addr()?;
         let mut jobs = JoinSet::<Result<Option<Candidate>>>::new();
+        let attempt = self.attempt;
         let publisher = room.clone();
         let recipient = member.clone();
         jobs.spawn(async move {
-            publisher.send(&recipient, description).await?;
+            publisher.send(&recipient, Signal::new(attempt, description)).await?;
             Ok(None)
         });
         let (binding, request, rx) = stun::Binding::new();
@@ -235,7 +255,7 @@ impl Link {
                         // A redundant route failing to publish must not close a working call.
                         let (room, member, call) = (room.clone(), member.clone(), self.call.clone());
                         jobs.spawn(async move {
-                            if let Err(e) = room.send(&member, Description::Ice(line)).await {
+                            if let Err(e) = room.send(&member, Signal::new(attempt, Description::Ice(line))).await {
                                 call.state.lock().log(format!("ICE signaling: {e}"));
                             }
                             Ok(None)
@@ -295,6 +315,7 @@ pub async fn connect(
     room: Arc<Room>,
     member: Member,
     offer: Option<String>,
+    attempt: u32,
     call: Arc<Call>,
     commands: mpsc::Receiver<Command>,
 ) -> Result<()> {
@@ -327,6 +348,7 @@ pub async fn connect(
         audio,
         call,
         session: member.session,
+        attempt,
         pending: BTreeSet::new(),
         name: member.name.clone(),
     };

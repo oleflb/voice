@@ -34,7 +34,11 @@ pub struct Peer {
     pub jitter: Jitter,
     pub audio_stream: Arc<()>,
     pub control: Option<mpsc::Sender<Command>>,
-    pub early_ice: Vec<str0m::Candidate>,
+    pub early_ice: Vec<(u32, str0m::Candidate)>,
+    pub attempt: u32,
+    pub next_retry: Instant,
+    pub failures: u8,
+    pub selected_ip: Option<std::net::IpAddr>,
     pub seen: Instant,
 }
 
@@ -57,6 +61,10 @@ impl Peer {
             audio_stream: Arc::new(()),
             control: None,
             early_ice: Vec::new(),
+            attempt: 0,
+            next_retry: Instant::now(),
+            failures: 0,
+            selected_ip: None,
             seen: Instant::now(),
         }
     }
