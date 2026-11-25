@@ -4,4 +4,12 @@ dist = "dist"
 locked = true
 
 [watch]
-watch = ["web", "crates/voice-core", "Cargo.toml", "Cargo.lock"]
+watch = ["web", "crates", "Cargo.toml", "Cargo.lock"]
+
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-ec", """
+cargo build --locked -p voice-playback --target wasm32-unknown-unknown --release --target-dir "${CARGO_TARGET_DIR:-target}"
+cp "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/voice_playback.wasm" "$TRUNK_STAGING_DIR/playback.wasm"
+"""]

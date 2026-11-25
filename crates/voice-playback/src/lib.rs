@@ -132,6 +132,9 @@ pub fn limit_mix(mix: &mut [f32; FRAME], master: f32, gain: &mut f32) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod worklet;
+
 #[cfg(test)]
 mod tests {
     use super::*;

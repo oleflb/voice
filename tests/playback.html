@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser playback regression</title>
+<pre id="result">Rendering…</pre>
+<!-- Serve the repo on localhost after building voice-playback for wasm32-unknown-unknown --release. -->
+<script type="module">
+const result = document.querySelector("pre");
+try {
+  const module = await WebAssembly.compileStreaming(fetch("../target/wasm32-unknown-unknown/release/voice_playback.wasm"));
+  const pcm = new Int16Array(await (await fetch("../src/audio/fixtures/first-phrase.s16le")).arrayBuffer());
+  const n = Math.floor(pcm.length / 320) * 960;
+  async function render(scale, volumes) {
+    const ctx = new OfflineAudioContext(1, n + 960, 48000);
+    await ctx.audioWorklet.addModule("../web/playback.js");
+    const node = new AudioWorkletNode(ctx, "voice-playback", {
+      numberOfInputs: 5, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit",
+      processorOptions: { module },
+    });
+    node.connect(ctx.destination);
+    const buf = ctx.createBuffer(1, n, 48000);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) data[i] = Math.max(-1, Math.min(1, pcm[Math.floor(i / 3)] * scale / 32768));
+    volumes.forEach((volume, slot) => {
+      const source = ctx.createBufferSource();
+      source.buffer = buf;
+      source.connect(node, 0, slot);
+      node.port.postMessage({ slot, volume });
+      source.start();
+    });
+    return (await ctx.startRendering()).getChannelData(0).subarray(960);
+  }
+  const checks = [];
+  function check(ok, text) { if (!ok) throw Error(text); checks.push(text); }
+  for (const [scale, reference] of [[0.06, -19.54], [1.2, -13.53]]) {
+    // RMS of the identical first phrase through native Leveler + limit_mix at 50%.
+    const samples = await render(scale, [0.5]);
+    const db = 10 * Math.log10(samples.reduce((sum, x) => sum + x*x, 0) / n);
+    check(Math.abs(db - reference) <= 2, `scale ${scale}: ${db.toFixed(2)} dBFS, native ${reference}`);
+    const muted = await render(scale, [0.5, 0]);
+    check(samples.every((x, i) => x === muted[i]), "Muted peer contributes nothing");
+  }
+  const overlap = await render(1.2, [1, 1]);
+  const peak = overlap.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+  check(peak > 0.9 && peak <= 0.94401, `Overlapping loud voices: peak ${peak.toFixed(4)}`);
+  result.textContent = `PASS\n${checks.join("\n")}`;
+} catch (e) { result.textContent = `FAIL: ${e.stack || e}`; }
+</script>
