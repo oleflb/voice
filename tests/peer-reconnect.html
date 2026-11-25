@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Participant reconnect regression</title>
+<pre>Running…</pre>
+<!-- Serve the repo on localhost after building the release playback WASM. -->
+<script type="module">
+import { run } from "./browser.js";
+await run(async signal => {
+  const load = window.fetch;
+  window.fetch = url => load(url.pathname?.endsWith("/playback.wasm")
+    ? "../target/wasm32-unknown-unknown/release/voice_playback.wasm" : url);
+  Object.defineProperty(navigator, "mediaDevices", { value: undefined });
+  let pc, channel;
+  window.RTCPeerConnection = class extends RTCPeerConnection {
+    constructor() { super(); pc = this; }
+    createDataChannel(label) { return channel = super.createDataChannel(label); }
+  };
+  const { startCall } = await import("../web/peer.js");
+  const receive = startCall({ announce: async () => {}, send: async () => {} }, signal, "Self", () => {});
+  const member = { session: "other", identity: "other", name: "Other" };
+  receive(member, { Presence: { dial: true } });
+  await Promise.resolve();
+  const attach = pc => pc.ontrack({ track: pc.getReceivers()[0].track });
+  await attach(pc);
+  const row = document.querySelector("#peers li:last-child");
+  const slider = row.querySelector("input");
+  slider.value = 37;
+  const old = pc, closed = channel.onclose;
+  let volume;
+  const post = MessagePort.prototype.postMessage;
+  MessagePort.prototype.postMessage = function (message, ...args) {
+    if (message?.slot === 0) volume = message.volume;
+    return post.call(this, message, ...args);
+  };
+  receive(member, { Signal: "Reconnect" });
+  await Promise.resolve();
+  closed(); // Delayed event from the replaced channel.
+  await attach(pc);
+  if (pc === old || old.signalingState !== "closed" || pc.signalingState === "closed"
+      || !row.isConnected || row.querySelector("input") !== slider || slider.value !== "37"
+      || volume !== 0.37 || row.querySelector("button").disabled) throw Error("Reconnect lost participant state");
+  receive(member, "Left");
+  if (row.isConnected) throw Error("Left participant still visible");
+});
+</script>

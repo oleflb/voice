@@ -96,15 +96,15 @@ export function startCall(room, lifetime, name, status) {
   const self = meter(selfRow);
   const activity = setInterval(() => {
     update(self, !mic);
-    for (const p of peers.values()) {
-      update(p.meter, p.muted);
-      connection(p);
-    }
+    for (const p of peers.values()) update(p.meter, p.muted);
   }, 100);
 
+  function connected(p) {
+    return !p.ended && p.lost == null && p.ch?.readyState === "open" && p.pc?.connectionState === "connected";
+  }
   function connection(p) {
-    const reason = p.ended || (p.ch?.readyState !== "open" || p.pc?.connectionState === "disconnected"
-      ? "Connecting" : performance.now() - p.seen >= 20000 ? "Waiting for heartbeat" : "");
+    const reason = p.ended || (p.lost != null ? "Reconnecting"
+      : connected(p) ? "" : "Connecting");
     if (reason === p.label.title) return;
     p.label.title = reason;
     p.label.setAttribute("aria-label", reason);
@@ -118,6 +118,7 @@ export function startCall(room, lifetime, name, status) {
     connection(p);
     clearTimeout(p.timer);
     clearTimeout(p.lost);
+    p.lost = null;
     p.retryAt = performance.now() + 1000 * 2 ** Math.min(p.failures++, 5);
     p.pc?.close();
     watchTrack(p.meter, null);
@@ -130,21 +131,20 @@ export function startCall(room, lifetime, name, status) {
       delete p.slot;
     }
     if (p.receiver) p.receiver.srcObject = null;
-    p.volume?.remove();
   }
-  function channel(p, ch) {
-    if (ch.label !== "voice" || p.ch || p.ended) { ch.close(); return; }
+  function channel(p, ch, current) {
+    if (ch.label !== "voice" || p.ch || !current()) { ch.close(); return; }
     p.ch = ch;
     ch.onopen = () => {
-      if (p.ended) return;
+      if (!current()) return;
       clearTimeout(p.timer);
       p.failures = 0;
       connection(p);
       ch.send(JSON.stringify({ type: "mute", muted: !mic }));
     };
-    ch.onclose = () => finish(p, "disconnected");
+    ch.onclose = () => { if (current()) finish(p, "disconnected"); };
     ch.onmessage = ({ data }) => {
-      if (p.ended || lifetime.aborted) return;
+      if (!current()) return;
       if (typeof data !== "string" || data.length > 16384) return;
       let msg;
       try { msg = JSON.parse(data); } catch { return; }
@@ -163,24 +163,32 @@ export function startCall(room, lifetime, name, status) {
     };
   }
 
-  async function signal(p, update) {
+  async function signal(p, update, current) {
     const send = description => sendSignal(p, description);
     async function add(candidate) {
+      if (!current()) return;
       try { await p.pc.addIceCandidate({ candidate, sdpMLineIndex: 0 }); }
       catch { /* An unusable route does not invalidate the other candidates. */ }
     }
+    async function accept(description) {
+      const candidates = p.candidates;
+      await p.pc.setRemoteDescription(JSON.parse(description));
+      for (const line of candidates) await add(line);
+      candidates.clear();
+    }
     if (update.Signal?.Ice) {
       const line = update.Signal.Ice;
-      if (p.candidates.size < 32 && !p.candidates.has(line)) {
-        p.candidates.add(line);
-        if (p.pc?.remoteDescription) await add(line);
-      }
+      if (p.pc?.remoteDescription) await add(line);
+      else if (p.candidates.size < 32) p.candidates.add(line);
+      return;
+    }
+    if (update.Signal?.Remove) {
+      p.candidates.delete(update.Signal.Remove);
       return;
     }
     if (update.Signal?.Answer) {
       if (p.pc?.signalingState === "have-local-offer") {
-        await p.pc.setRemoteDescription(JSON.parse(update.Signal.Answer));
-        for (const line of p.candidates) await add(line);
+        await accept(update.Signal.Answer);
       }
       return;
     }
@@ -188,20 +196,28 @@ export function startCall(room, lifetime, name, status) {
     if (p.pc || (!update.Presence?.dial && !offer)) return;
     const pc = p.pc = new RTCPeerConnection({ bundlePolicy: "max-bundle", iceServers: stun ? [{ urls: `stun:${stun}` }] : [] });
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate?.candidate && !p.ended && !lifetime.aborted) send({ Ice: candidate.candidate }).catch(e => status(e.message));
+      if (candidate?.candidate && current()) send({ Ice: candidate.candidate }).catch(e => { if (current()) status(e.message); });
     };
-    p.timer = setTimeout(() => finish(p, "connection failed"), 30000);
-    pc.onconnectionstatechange = () => {
-      clearTimeout(p.lost);
-      if (pc.connectionState === "failed") finish(p, "connection failed");
-      if (pc.connectionState === "disconnected") p.lost = setTimeout(() => finish(p, "disconnected"), 8000);
+    p.timer = setTimeout(() => { if (current()) finish(p, "connection failed"); }, 30000);
+    pc.oniceconnectionstatechange = pc.onconnectionstatechange = () => {
+      if (!current()) return;
+      const ice = pc.iceConnectionState;
+      if (ice === "failed" || pc.connectionState === "failed") return finish(p, "connection failed");
+      if (ice === "disconnected" || pc.connectionState === "disconnected"
+          || (ice === "checking" && p.ch?.readyState === "open")) {
+        p.lost ??= setTimeout(() => { if (current()) finish(p, "disconnected"); }, 8000);
+      } else if ((ice === "connected" || ice === "completed") && pc.connectionState === "connected") {
+        clearTimeout(p.lost);
+        p.lost = null;
+      }
+      connection(p);
     };
     pc.ontrack = async ({ track }) => {
       try {
         await (loading ??= loadMixer());
-        if (p.ended || lifetime.aborted) return;
+        if (!current()) return;
         attachTrack(p, track);
-      } catch (e) { status(`Speakers unavailable: ${e.message}`); }
+      } catch (e) { if (current()) status(`Speakers unavailable: ${e.message}`); }
     };
     function attachTrack(p, track) {
       // Chromium needs a playing media element to pull decoded RTP into Web Audio.
@@ -218,7 +234,12 @@ export function startCall(room, lifetime, name, status) {
       while ([...peers.values()].some(peer => peer.slot === slot)) slot++;
       p.slot = slot;
       p.meter.source.connect(mixer, 0, slot);
-      const panel = p.volume = append(p.row, "div", "");
+      p.button.disabled = false;
+      if (p.slider) {
+        mixer.port.postMessage({ slot, volume: p.slider.valueAsNumber / 100 });
+        return;
+      }
+      const panel = append(p.row, "div", "");
       panel.popover = "auto";
       panel.className = "user-volume";
       panel.onkeydown = event => {
@@ -228,7 +249,6 @@ export function startCall(room, lifetime, name, status) {
         p.button.focus();
       };
       p.button.popoverTargetElement = panel;
-      p.button.disabled = false;
       p.button.oncontextmenu = event => {
         event.preventDefault();
         p.button.focus();
@@ -236,7 +256,7 @@ export function startCall(room, lifetime, name, status) {
       };
       const label = append(panel, "label", "User volume");
       const percent = append(label, "span", "");
-      const slider = append(label, "input", "");
+      const slider = p.slider = append(label, "input", "");
       slider.type = "range";
       slider.autofocus = true;
       slider.setAttribute("aria-label", `Volume for ${p.name}`);
@@ -244,7 +264,7 @@ export function startCall(room, lifetime, name, status) {
       const stored = Number(localStorage.getItem(`${key}.leveled`) ?? Number(localStorage.getItem(key) ?? 1) / 2);
       slider.value = Math.round(100 * (Number.isFinite(stored) ? Math.min(1, Math.max(0, stored)) : 0.5));
       function showPercent() {
-        mixer.port.postMessage({ slot, volume: slider.valueAsNumber / 100 });
+        if (p.slot !== undefined) mixer.port.postMessage({ slot: p.slot, volume: slider.valueAsNumber / 100 });
         percent.textContent = `${slider.value}%`;
         slider.setAttribute("aria-valuetext", percent.textContent);
       }
@@ -255,20 +275,20 @@ export function startCall(room, lifetime, name, status) {
       };
     }
     if (offer) {
-      pc.ondatachannel = ({ channel: ch }) => channel(p, ch);
-      await pc.setRemoteDescription(JSON.parse(offer));
-      for (const line of p.candidates) await add(line);
+      pc.ondatachannel = ({ channel: ch }) => channel(p, ch, current);
+      await accept(offer);
       // An answerer must explicitly opt into sending on the offered track.
+      if (!current()) return;
       p.audio = pc.getTransceivers().find(t => t.receiver.track.kind === "audio");
       p.audio.direction = "sendrecv";
     } else {
       p.audio = pc.addTransceiver("audio", { direction: "sendrecv" });
-      channel(p, pc.createDataChannel("voice"));
+      channel(p, pc.createDataChannel("voice"), current);
     }
     await p.audio.sender.replaceTrack(mic ?? null);
     await pc.setLocalDescription(offer ? await pc.createAnswer() : await pc.createOffer());
     const description = { [offer ? "Answer" : "Offer"]: JSON.stringify(pc.localDescription) };
-    if (!lifetime.aborted && !p.ended) await send(description);
+    if (current()) await send(description);
   }
 
   function sendSignal(p, signal) {
@@ -283,10 +303,12 @@ export function startCall(room, lifetime, name, status) {
     }
     let attempt = update.Signal?.attempt ?? 0;
     if (attempt) update = { Signal: update.Signal.signal };
-    let failures = p?.failures ?? 0;
-    let candidates = new Set();
     const retry = p && performance.now() >= (p.retryAt ?? 0);
     if (p && update.Signal && attempt < p.attempt) return;
+    if (p && attempt > p.attempt && update.Signal?.Remove) {
+      if (p.nextIce?.attempt === attempt) p.nextIce.candidates.delete(update.Signal.Remove);
+      return;
+    }
     if (p && attempt > p.attempt && update.Signal?.Ice) {
       if (p.nextIce?.attempt !== attempt) p.nextIce = { attempt, candidates: new Set() };
       if (p.nextIce.candidates.size < 32) p.nextIce.candidates.add(update.Signal.Ice);
@@ -302,11 +324,11 @@ export function startCall(room, lifetime, name, status) {
       update = { Presence: { dial: true } };
     }
     if (p && attempt > p.attempt && (update.Signal?.Offer || update.Presence?.dial)) {
-      if (p.nextIce?.attempt === attempt) candidates = p.nextIce.candidates;
+      const candidates = p.nextIce?.attempt === attempt ? p.nextIce.candidates : new Set();
       finish(p, "reconnecting");
-      p.row.remove();
-      peers.delete(member.session);
-      p = null;
+      Object.assign(p, { attempt, candidates, pc: null, audio: null, ch: null, receiver: null,
+        ended: null, nextIce: null, retryAt: 0, seen: performance.now(), work: Promise.resolve() });
+      connection(p);
     }
     if (p && update.Signal && attempt !== p.attempt) return;
     if (!p) {
@@ -317,7 +339,7 @@ export function startCall(room, lifetime, name, status) {
       button.disabled = true;
       button.title = `Adjust volume for ${name}`;
       append(button, "span", name).className = "participant-name";
-      p = { member, name, row, button, attempt, failures, seen: performance.now(), meter: meter(button), label: append(button, "span", ""), pending: new Map(), candidates, work: Promise.resolve() };
+      p = { member, name, row, button, attempt, failures: 0, seen: performance.now(), meter: meter(button), label: append(button, "span", ""), pending: new Map(), candidates: new Set(), work: Promise.resolve() };
       p.label.className = "connection";
       p.label.setAttribute("role", "img");
       connection(p);
@@ -326,7 +348,10 @@ export function startCall(room, lifetime, name, status) {
     }
     if (update.Presence) p.seen = performance.now();
     if (update.Signal || (update.Presence?.dial && !p.pc)) {
-      p.work = p.work.then(() => !lifetime.aborted && !p.ended && signal(p, update)).catch(() => finish(p, "connection failed"));
+      const version = p.attempt;
+      const current = () => !lifetime.aborted && !p.ended && p.attempt === version;
+      p.work = p.work.then(() => current() && signal(p, update, current))
+        .catch(() => { if (current()) finish(p, "connection failed"); });
     }
   }
   async function publishPresence() {
@@ -337,7 +362,7 @@ export function startCall(room, lifetime, name, status) {
   async function announce() {
     await publishPresence();
     for (const [id, p] of peers) {
-      if (performance.now() - p.seen > 35000 && p.ch?.readyState !== "open") {
+      if (performance.now() - p.seen > 35000 && (!p.pc || p.ended)) {
         finish(p, "left"); p.row.remove(); peers.delete(id);
       }
     }
@@ -396,10 +421,12 @@ export function startCall(room, lifetime, name, status) {
       for (const p of peers.values()) {
         if (version !== generation) return;
         if (p.audio && p.pc.signalingState !== "closed") {
+          const pc = p.pc;
           try {
             await p.audio.sender.replaceTrack(mic);
+            if (version !== generation || pc !== p.pc || p.ended) continue;
             if (p.ch?.readyState === "open") p.ch.send(JSON.stringify({ type: "mute", muted: !mic }));
-          } catch (e) { status(`Could not change the microphone for ${p.name}: ${e.message}`); }
+          } catch (e) { if (version === generation && pc === p.pc && !p.ended) status(`Could not change the microphone for ${p.name}: ${e.message}`); }
         }
       }
     } catch (e) {
