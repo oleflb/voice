@@ -98,6 +98,7 @@ pub struct State {
 #[derive(Clone)]
 pub struct ChatLine {
     text: Arc<str>,
+    message_id: Option<u32>,
     pub own_name_len: usize,
 }
 
@@ -122,43 +123,43 @@ impl State {
             }
         }
     }
-    pub fn send_chat(&mut self, name: &str, text: String) {
-        if self.peers.is_empty() {
-            self.push_line(format!("{name}: {text}"), name.len());
-            self.log("No recipients".into());
-            return;
-        }
-        let Some(next) = self.next_message.checked_add(1) else {
-            self.log("Message IDs exhausted; rejoin the room".into());
-            return;
-        };
-        self.next_message = next;
-        let id = self.next_message;
-        self.push_line(format!("{name} #{id}: {text}"), name.len());
-        let mut missed = Vec::new();
+    pub fn send_chat(&mut self, name: &str, text: &str) -> bool {
+        let id = self.next_message.wrapping_add(1).max(1);
+        let mut sent = 0;
         for p in self.peers.values() {
-            if p.status != Status::Connected
-                || !p
-                    .control
-                    .as_ref()
-                    .is_some_and(|tx| tx.try_send(Command::Chat(id, text.clone())).is_ok())
+            if p.status == Status::Connected
+                && let Some(tx) = &p.control
+                && tx.try_send(Command::Chat(id, text.to_owned())).is_ok()
             {
-                missed.push(p.member.name.clone());
+                sent += 1;
             }
         }
-        if !missed.is_empty() {
-            self.log(format!("#{id} not sent to {}", missed.join(", ")));
+        if sent == 0 {
+            return false;
+        }
+        self.next_message = id;
+        self.push_line(format!("{name}: {text}"), name.len(), Some(id));
+        if sent < self.peers.len() {
+            self.mark_chat_failed(id);
+        }
+        true
+    }
+    pub fn mark_chat_failed(&mut self, id: u32) {
+        if let Some(line) = self.chat.iter_mut().find(|l| l.message_id == Some(id)) {
+            line.text = format!("{} [not sent to everyone]", line.text).into();
+            line.message_id = None;
         }
     }
     pub fn log(&mut self, line: String) {
-        self.push_line(line, 0);
+        self.push_line(line, 0, None);
     }
-    fn push_line(&mut self, line: String, own_name_len: usize) {
+    fn push_line(&mut self, line: String, own_name_len: usize, message_id: Option<u32>) {
         if self.chat.len() == 100 {
             self.chat.pop_front();
         }
         self.chat.push_back(ChatLine {
             text: line.into(),
+            message_id,
             own_name_len,
         });
     }

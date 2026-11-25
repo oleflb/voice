@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::PublicKey;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     future::poll_fn,
     io,
     net::{IpAddr, SocketAddr},
@@ -258,7 +258,6 @@ struct Link {
     audio: Option<Mid>,
     call: Arc<Call>,
     session: PublicKey,
-    pending: BTreeSet<u32>,
     name: String,
     attempt: u32,
     lost: Option<Instant>,
@@ -325,15 +324,8 @@ impl Link {
                 }
             }
             Command::Chat(id, text) => {
-                if self.pending.len() >= 100
-                    || !matches!(self.try_send(Message::Chat { id, text }), Ok(true))
-                {
-                    self.call
-                        .state
-                        .lock()
-                        .log(format!("{}: #{id} not sent", self.name));
-                } else {
-                    self.pending.insert(id);
+                if !matches!(self.try_send(Message::Chat { id, text }), Ok(true)) {
+                    self.call.state.lock().mark_chat_failed(id);
                 }
             }
             Command::Audio(at, sample, data) => {
@@ -425,13 +417,9 @@ impl Link {
                 match serde_json::from_slice(&d.data) {
                     Ok(Message::Chat { id, text }) if valid(&text) => {
                         self.call.state.lock().log(format!("{}: {text}", self.name));
-                        ensure!(self.try_send(Message::Ack { id })?, "channel busy");
+                        // Older clients still display delivery receipts.
+                        let _ = self.try_send(Message::Ack { id });
                     }
-                    Ok(Message::Ack { id }) if self.pending.remove(&id) => self
-                        .call
-                        .state
-                        .lock()
-                        .log(format!("{}: delivered #{id}", self.name)),
                     Ok(Message::Mute { muted }) => {
                         if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
                             && p.attempt == self.attempt
@@ -645,12 +633,6 @@ impl Drop for Link {
                 }
             }
         }
-        if !self.pending.is_empty() {
-            self.call.state.lock().log(format!(
-                "{}: delivery unknown for {:?}",
-                self.name, self.pending
-            ));
-        }
     }
 }
 
@@ -726,7 +708,6 @@ pub async fn connect(
         audio,
         call,
         session: member.session,
-        pending: BTreeSet::new(),
         name: member.name.clone(),
     };
     link.drive(commands, room, member, description, network, jobs)

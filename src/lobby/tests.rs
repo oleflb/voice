@@ -1,6 +1,35 @@
 use super::*;
 use nostr_relay_builder::MockRelay;
 
+#[test]
+fn partial_chat_failure_marks_the_original_line_once() {
+    let mut state = crate::call::State::default();
+    let (tx, mut rx) = mpsc::channel(1);
+    for name in ["Bob", "Carol"] {
+        let key = nostr_sdk::Keys::generate().public_key();
+        let member = Member {
+            identity: key,
+            session: key,
+            name: name.into(),
+        };
+        let mut peer = Peer::new(member, &state.levels);
+        if name == "Bob" {
+            peer.status = Status::Connected;
+            peer.control = Some(tx.clone());
+        }
+        state.peers.insert(key, peer);
+    }
+    assert!(state.send_chat("Alice", "hello"));
+    assert!(!state.send_chat("Alice", "queue full"));
+    let marked = "Alice: hello [not sent to everyone]";
+    assert_eq!(state.chat[0].as_ref(), marked);
+    let Command::Chat(id, _) = rx.try_recv().unwrap() else {
+        panic!("expected chat")
+    };
+    state.mark_chat_failed(id);
+    assert!(state.chat.iter().map(|l| l.as_ref()).eq([marked]));
+}
+
 async fn until(mut ready: impl FnMut() -> bool, message: &str) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(18), async {
         while !ready() {
@@ -104,7 +133,7 @@ async fn live_links_move_to_ethernet_and_back() -> Result<()> {
         for call in [&alice, &bob, &carol] {
             let mut s = call.state.lock();
             s.set_mic(true);
-            s.send_chat(&call.name, message.clone());
+            assert!(s.send_chat(&call.name, &message));
             for p in s.peers.values_mut() {
                 p.packets.clear();
             }
@@ -281,18 +310,14 @@ async fn exercise_call(
         "Bob should receive chat and Alice's unmute",
     )
     .await?;
-    until(
-        || {
-            alice
-                .state
-                .lock()
-                .chat
-                .iter()
-                .any(|line| line.as_ref() == "Bob: delivered #1")
-        },
-        "Alice should receive a delivery receipt",
-    )
-    .await?;
+    assert!(
+        alice
+            .state
+            .lock()
+            .chat
+            .iter()
+            .any(|line| line.as_ref() == "Alice: hello")
+    );
 
     depart(&bob_active)
         .context("Bob should have an active signaling session")?

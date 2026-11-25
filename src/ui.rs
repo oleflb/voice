@@ -845,10 +845,16 @@ impl View {
                     if let Some(call) = active
                         && valid(&self.chat_input.text, 1024)
                     {
-                        let text = std::mem::take(&mut self.chat_input).text;
-                        let mut state = call.state.lock();
-                        state.send_chat(&call.name, text);
-                        self.chat_scroll = 0;
+                        if call
+                            .state
+                            .lock()
+                            .send_chat(&call.name, &self.chat_input.text)
+                        {
+                            self.chat_input = TextEdit::default();
+                            self.chat_scroll = 0;
+                        } else {
+                            self.chat_input.error = "No reachable peers; message kept".into();
+                        }
                     }
                 }
                 KeyCode::Up => self.chat_scroll = self.chat_scroll.saturating_add(1),
@@ -1140,19 +1146,14 @@ mod tests {
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut first,
         )?;
-        for text in ["jkl", "hello"] {
-            for ch in text.chars() {
-                view.key(KeyCode::Char(ch), &mut first)?;
-            }
-            view.key(KeyCode::Enter, &mut first)?;
+        for ch in "hello".chars() {
+            view.key(KeyCode::Char(ch), &mut first)?;
         }
+        view.key(KeyCode::Enter, &mut first)?;
         assert!(view.focus == Pane::Chat);
-        assert!(call.state.lock().chat.iter().map(|s| s.as_ref()).eq([
-            "Alice: jkl",
-            "No recipients",
-            "Alice: hello",
-            "No recipients"
-        ]));
+        assert_eq!(view.chat_input.text, "hello");
+        assert!(!view.chat_input.error.is_empty());
+        assert!(call.state.lock().chat.is_empty());
         call.state.lock().log("wrapped message ".repeat(40));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20))?;
         // Even stale relay presence must not put a warning on a healthy direct call.
