@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use nostr_relay_builder::MockRelay;
 
 #[test]

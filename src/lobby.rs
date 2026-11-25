@@ -5,7 +5,7 @@ use crate::{
     config::{Config, Room},
     peer::{self, Command},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use nostr_sdk::SecretKey;
 use std::{
     collections::BTreeMap,
