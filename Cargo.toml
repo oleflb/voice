@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/voice-core"]
+members = ["crates/voice-core", "crates/voice-playback"]
 resolver = "3"
 
 [package]
