@@ -43,6 +43,169 @@ async fn until(mut ready: impl FnMut() -> bool, message: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn start_video_peer<const LAST_OCTET: u8>(
+    jobs: &mut JoinSet<Result<()>>,
+    room: &Room,
+    url: &str,
+    name: &str,
+) -> (Arc<Call>, watch::Sender<Option<Arc<Call>>>) {
+    use std::net::IpAddr;
+    let room = room.clone();
+    let url = url.to_owned();
+    let call = Call::new(room.clone(), name.to_owned());
+    let (active, mut wanted) = watch::channel(Some(call.clone()));
+    jobs.spawn(async move {
+        room_session(
+            &room,
+            SecretKey::generate().to_secret_bytes(),
+            &url,
+            || Ok(vec![IpAddr::from([127, 0, 0, LAST_OCTET]).into()]),
+            &mut wanted,
+            &watch::channel(None).0,
+        )
+        .await
+    });
+    (call, active)
+}
+
+#[cfg(target_os = "linux")]
+fn start_video_encoder(
+    jobs: &mut JoinSet<Result<()>>,
+    sender: &Arc<Call>,
+    pattern: &str,
+    fps: &str,
+) {
+    use crate::video::{VP8_PIPELINE, run_encoder};
+    let mut source = tokio::process::Command::new("gst-launch-1.0");
+    source
+        .args(["-q", "videotestsrc", "is-live=true", pattern, "!", fps])
+        .args(VP8_PIPELINE);
+    let sender = sender.clone();
+    jobs.spawn(async move { run_encoder(source, &sender.video.frames, sender.started).await });
+}
+
+#[cfg(target_os = "linux")]
+async fn subscribe_to_native(terminal: &Call) -> Result<mpsc::Receiver<crate::video::Frame>> {
+    let (tx, rx) = mpsc::channel(crate::video::QUEUE);
+    until(
+        || {
+            terminal
+                .state
+                .lock()
+                .peers
+                .values()
+                .find(|p| p.member.name == "Native" && p.sharing && p.status == Status::Connected)
+                .is_some_and(|p| {
+                    p.viewer.send_replace(Some(tx.clone()));
+                    true
+                })
+        },
+        "Terminal sees the native share",
+    )
+    .await?;
+    Ok(rx)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a built web client served locally, Firefox and the GStreamer plugins"]
+async fn native_video_with_late_browser_and_terminal_viewers() -> Result<()> {
+    use tokio::process::Command as Process;
+
+    let relay = MockRelay::run().await?;
+    let url = relay.url().await.to_string();
+    let room = Room::new("VideoTest");
+    let mut jobs = JoinSet::new();
+    let (sender, _sender_active) = start_video_peer::<2>(&mut jobs, &room, &url, "Native");
+    let (terminal, _terminal_active) = start_video_peer::<3>(&mut jobs, &room, &url, "Terminal");
+
+    let page = std::env::var("VOICE_TEST_BROWSER_URL")
+        .context("Set VOICE_TEST_BROWSER_URL to the served tests/peer-video-native.html")?;
+    let profile = tempfile::tempdir()?;
+    std::fs::write(
+        profile.path().join("user.js"),
+        r#"
+        user_pref("media.peerconnection.ice.loopback", true);
+        user_pref("media.peerconnection.ice.obfuscate_host_addresses", false);
+    "#,
+    )?;
+    let _browser =
+        Process::new(std::env::var_os("VOICE_TEST_FIREFOX").unwrap_or_else(|| "firefox".into()))
+            .args(["--headless", "--no-remote", "--profile"])
+            .arg(profile.path())
+            .arg(format!("{page}?stun=#{}|{url}", room.invite()?))
+            .kill_on_drop(true)
+            .spawn()?;
+
+    let browser_said = |message: &str| {
+        sender
+            .state
+            .lock()
+            .chat
+            .iter()
+            .any(|line| line.as_ref() == format!("Browser: {message}"))
+    };
+    until(
+        || {
+            sender
+                .state
+                .lock()
+                .peers
+                .values()
+                .any(|p| p.member.name == "Browser" && p.status == Status::Connected)
+        },
+        "Native connects to the browser",
+    )
+    .await?;
+    assert!(sender.state.lock().send_chat("Native", "ready"));
+    until(
+        || browser_said("ready"),
+        "The real browser joins the native call",
+    )
+    .await?;
+    assert_eq!(sender.video.frames.receiver_count(), 0);
+    // Model the repeated input pipewiresrc emits when the desktop stops changing.
+    let mut encoder = JoinSet::new();
+    start_video_encoder(
+        &mut encoder,
+        &sender,
+        "pattern=black",
+        "video/x-raw,framerate=10/1",
+    );
+    sender.video.sharing.send_replace(true);
+    until(
+        || browser_said("first frame"),
+        "Browser decodes the native 1080p stream",
+    )
+    .await?;
+    let mut rx = subscribe_to_native(&terminal).await?;
+    let frame = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await?
+        .context("Late terminal viewer gets a keyframe while the source is static")?;
+    assert!(frame.key());
+    assert_eq!(*sender.video.viewers.borrow(), 2);
+    sender.video.stop();
+    encoder.shutdown().await;
+    until(
+        || browser_said("stopped") && *sender.video.viewers.borrow() == 0,
+        "Stop removes the browser tile and both subscriptions",
+    )
+    .await?;
+    start_video_encoder(
+        &mut encoder,
+        &sender,
+        "pattern=white",
+        "video/x-raw,framerate=10/1",
+    );
+    sender.video.sharing.send_replace(true);
+    until(
+        || browser_said("restarted"),
+        "Browser decodes a fresh stream after restart",
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn live_links_move_to_ethernet_and_back() -> Result<()> {
     use std::{net::IpAddr, sync::atomic::AtomicU8};

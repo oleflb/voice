@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native video in a real browser</title>
+<pre>Running…</pre>
+<script type="module">
+import { $, check, run } from "./browser.js";
+
+await run(async signal => {
+  const [invite, relay] = location.hash.slice(1).split("|").map(decodeURIComponent);
+  const page = new DOMParser().parseFromString(await (await fetch("/dist/index.html")).text(), "text/html");
+  const binding = page.querySelector('link[rel="modulepreload"][href*="voice-core"]').getAttribute("href");
+  const binary = page.querySelector('link[as="fetch"][href*="voice-core"]').getAttribute("href");
+  const wasm = await import(new URL(binding, location.origin + "/dist/"));
+  await wasm.default({ module_or_path: new URL(binary, location.origin + "/dist/") });
+  const { startCall } = await import("/dist/peer.js");
+  Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
+    value: () => Promise.reject(new DOMException("No microphone needed", "NotAllowedError")),
+  });
+  const room = await wasm.join(invite, wasm.installation_key(), "Browser", relay);
+  $("call").hidden = false;
+  const receive = startCall(room, signal, "Browser", text => { $("status").textContent = text; });
+  void (async () => {
+    while (!signal.aborted) receive(...JSON.parse(await room.next()));
+  })();
+  const wait = async (predicate, label) => {
+    const end = performance.now() + 14000;
+    while (performance.now() < end) {
+      const result = predicate();
+      if (result) return result;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw Error(`${label}: ${$("status").textContent}`);
+  };
+  const chat = text => { $("text").value = text; $("compose").requestSubmit(); };
+  const watch = () => [...document.querySelectorAll("#peers button")].find(el => el.textContent === "Watch video");
+  const video = () => document.querySelector("#peers video");
+  const watchFrame = async white => {
+    (await wait(watch, "share announcement")).click();
+    await wait(() => video()?.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA, "decoded frame");
+    check(video().videoWidth === 1920 && video().videoHeight === 1080, "native 1080p frame");
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 1;
+    const pixels = canvas.getContext("2d", { willReadFrequently: true });
+    await wait(() => {
+      pixels.drawImage(video(), 0, 0, 1, 1);
+      const red = pixels.getImageData(0, 0, 1, 1).data[0];
+      return white ? red > 240 : red < 15;
+    }, "frame from the current encoder");
+  };
+  await wait(() => [...$("chat").children].some(line => line.textContent === "Native: ready"), "native handshake");
+  chat("ready");
+  await watchFrame(false);
+  chat("first frame");
+  await wait(() => !video() && !watch(), "share stopped");
+  chat("stopped");
+  await watchFrame(true);
+  chat("restarted");
+});
+</script>
