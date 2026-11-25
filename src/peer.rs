@@ -1,4 +1,5 @@
 use crate::{
+    network::Interface,
     call::{Call, Status},
     stun,
 };
@@ -6,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::PublicKey;
 use std::{
     collections::BTreeSet,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -32,8 +33,62 @@ pub fn valid(text: &str) -> bool {
     !text.trim().is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
 }
 
-struct Link {
+struct Route {
+    interface: Interface,
+    local: SocketAddr,
     socket: Arc<UdpSocket>,
+    candidates: Vec<Candidate>,
+    binding: stun::Binding,
+}
+
+impl Route {
+    fn retire(&self, rtc: &mut Rtc, mut unpublish: impl FnMut(Description)) {
+        for c in &self.candidates {
+            rtc.direct_api().invalidate_candidate(c);
+            unpublish(Description::Remove(c.to_sdp_string()));
+        }
+    }
+    async fn open(
+        interface: Interface,
+        rtc: &mut Rtc,
+        jobs: &mut JoinSet<Result<Option<Candidate>>>,
+        call: Arc<Call>,
+    ) -> Result<Self> {
+        let socket = Arc::new(interface.bind().await?);
+        let local = socket.local_addr()?;
+        let host = Candidate::host(local, "udp")?;
+        let host = rtc
+            .add_local_candidate(host)
+            .context("Duplicate host candidate")?
+            .clone();
+        let (binding, request, rx) = stun::Binding::new();
+        let server =
+            std::env::var("VOICE_STUN").unwrap_or_else(|_| "stun.cloudflare.com:3478".into());
+        if !server.is_empty() && !local.ip().is_loopback() {
+            let socket = socket.clone();
+            jobs.spawn(async move {
+                match stun::gather(&socket, &server, request, rx).await {
+                    Ok(candidate) => Ok(Some(candidate)),
+                    Err(e) => {
+                        call.state.lock().log(format!("STUN on {local}: {e}"));
+                        Ok(None)
+                    }
+                }
+            });
+        }
+        Ok(Self {
+            local,
+            socket,
+            interface,
+            binding,
+            candidates: vec![host],
+        })
+    }
+
+}
+
+struct Link {
+    route: Route,
     rtc: Rtc,
     offer: Option<SdpPendingOffer>,
     early: Vec<Candidate>,
@@ -190,9 +245,9 @@ impl Link {
         room: Arc<Room>,
         member: Member,
         description: Description,
+        mut jobs: JoinSet<Result<Option<Candidate>>>,
     ) -> Result<()> {
-        let local = self.socket.local_addr()?;
-        let mut jobs = JoinSet::<Result<Option<Candidate>>>::new();
+        let local = self.route.local;
         let attempt = self.attempt;
         let publisher = room.clone();
         let recipient = member.clone();
@@ -200,24 +255,6 @@ impl Link {
             publisher.send(&recipient, Signal::new(attempt, description)).await?;
             Ok(None)
         });
-        let (binding, request, rx) = stun::Binding::new();
-        let server =
-            std::env::var("VOICE_STUN").unwrap_or_else(|_| "stun.cloudflare.com:3478".into());
-        if !server.is_empty() && !local.ip().is_loopback() {
-            let socket = self.socket.clone();
-            let call = self.call.clone();
-            jobs.spawn(async move {
-                match stun::gather(&socket, &server, request, rx).await {
-                    Ok(candidate) => Ok(Some(candidate)),
-                    Err(e) => {
-                        call.state
-                            .lock()
-                            .log(format!("STUN unavailable ({e}); trying local routes"));
-                        Ok(None)
-                    }
-                }
-            });
-        }
         let started = Instant::now();
         let mut buffer = [0; 65536];
         let mut mute = self.call.state.lock().muted.subscribe();
@@ -235,7 +272,7 @@ impl Link {
                 match self.rtc.poll_output()? {
                     Output::Timeout(t) => break t,
                     Output::Transmit(tx) => {
-                        self.socket.send_to(&tx.contents, tx.destination).await?;
+                        self.route.socket.send_to(&tx.contents, tx.destination).await?;
                     }
                     Output::Event(event) => self.event(event)?,
                 }
@@ -263,9 +300,9 @@ impl Link {
                     }
                 }
                 cmd = commands.recv() => match cmd { Some(cmd) => self.command(cmd)?, None => break },
-                incoming = self.socket.recv_from(&mut buffer) => {
+                incoming = self.route.socket.recv_from(&mut buffer) => {
                     let (n, source) = incoming?;
-                    if binding.receive(source, &buffer[..n]) { continue; }
+                    if self.route.binding.receive(source, &buffer[..n]) { continue; }
                     if let Ok(contents) = buffer[..n].try_into() {
                         self.rtc.handle_input(Input::Receive(Instant::now(),Receive{proto:Protocol::Udp, source,destination:local,contents}))?;
                     }
@@ -285,7 +322,7 @@ impl Drop for Link {
             while let Ok(output) = self.rtc.poll_output() {
                 match output {
                     Output::Transmit(tx) => {
-                        let _ = self.socket.try_send_to(&tx.contents, tx.destination);
+                        let _ = self.route.socket.try_send_to(&tx.contents, tx.destination);
                     }
                     Output::Timeout(_) => break,
                     Output::Event(_) => {}
@@ -319,10 +356,9 @@ pub async fn connect(
     call: Arc<Call>,
     commands: mpsc::Receiver<Command>,
 ) -> Result<()> {
-    let socket = UdpSocket::bind((ip, 0)).await?;
     let mut rtc = new_rtc(Instant::now());
-    rtc.add_local_candidate(Candidate::host(socket.local_addr()?, "udp")?)
-        .context("Invalid host candidate")?;
+    let mut jobs = JoinSet::new();
+    let route = Route::open(ip.into(), &mut rtc, &mut jobs, call.clone()).await?;
     let mut api = rtc.sdp_api();
     let mut audio = None;
     let (description, pending) = if let Some(offer) = offer {
@@ -340,7 +376,7 @@ pub async fn connect(
         )
     };
     let mut link = Link {
-        socket: Arc::new(socket),
+        route,
         rtc,
         offer: pending,
         early: Vec::new(),
@@ -352,5 +388,5 @@ pub async fn connect(
         pending: BTreeSet::new(),
         name: member.name.clone(),
     };
-    link.drive(commands, room, member, description).await
+    link.drive(commands, room, member, description, jobs).await
 }
