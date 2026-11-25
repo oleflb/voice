@@ -293,6 +293,7 @@ async fn room_session(
                 if let Some(c) = &call {
                     c.state.lock().peers.retain(|_, p| p.control.is_some() || p.seen.elapsed() < Duration::from_secs(35));
                     if let Ok(current) = bind_ips() {
+                        let restored = previous.is_empty() && !current.is_empty();
                         network.send_modify(|published| {
                             // Retire vanished paths immediately; debounce additions while a fallback exists.
                             let has_route = published.iter().any(|i| current.contains(i));
@@ -300,6 +301,14 @@ async fn room_session(
                             *published = current.iter().filter(|i| !has_route || previous.contains(i)).cloned().collect();
                         });
                         previous = current;
+                        if restored {
+                            let pending: Vec<_> = c.state.lock().peers.values()
+                                .filter(|p| p.control.is_none() && p.status != Status::Present)
+                                .map(|p| p.member.clone()).collect();
+                            for member in pending {
+                                update_peer(c, &room, member, None, &network, &mut jobs);
+                            }
+                        }
                     }
                 }
             }
@@ -329,7 +338,7 @@ async fn room_session(
                     roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
                 }
                 if matches!(update, Update::Left) { continue; }
-                if let Some(c) = &call { update_peer(c, &room, member, update, &network, &mut jobs); }
+                if let Some(c) = &call { update_peer(c, &room, member, Some(update), &network, &mut jobs); }
             }
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {}
         }
@@ -340,7 +349,7 @@ fn update_peer(
     call: &Arc<Call>,
     room: &Arc<voice_core::Room>,
     member: Member,
-    update: Update,
+    update: Option<Update>,
     network: &watch::Sender<Vec<Interface>>,
     jobs: &mut JoinSet<()>,
 ) {
@@ -352,7 +361,7 @@ fn update_peer(
     if !state.peers.contains_key(&id) {
         let p = Peer::new(member.clone(), &state.levels);
         state.peers.insert(id, p);
-        if matches!(update, Update::Presence { .. }) {
+        if matches!(update, Some(Update::Presence { .. })) {
             let room = room.clone();
             jobs.spawn(async move {
                 let _ = room.announce().await;
@@ -362,7 +371,7 @@ fn update_peer(
     let Some(p) = state.peers.get_mut(&id) else {
         return;
     };
-    if matches!(update, Update::Presence { .. }) {
+    if matches!(update, Some(Update::Presence { .. })) {
         p.seen = Instant::now();
     }
     let now = Instant::now();
@@ -371,9 +380,14 @@ fn update_peer(
         .attempt
         .saturating_add(1)
         .max(u32::try_from(call.started.elapsed().as_secs()).unwrap_or(u32::MAX));
+    // A local route wake retries the last role without refreshing remote presence.
+    let restored = update.is_none();
+    let update = update.unwrap_or_else(|| Update::Presence {
+        dial: room.dials(id),
+    });
     let offer = match &update {
         Update::Presence { dial } => {
-            if p.control.is_some() || now < p.next_retry {
+            if p.control.is_some() || (!restored && now < p.next_retry) {
                 return;
             }
             if !dial {
