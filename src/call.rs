@@ -80,6 +80,8 @@ pub struct Call {
 #[derive(Default)]
 pub struct State {
     pub signaling: Option<Arc<voice_core::Room>>,
+    pub discovery_unavailable: bool,
+    pub notice: Option<(Instant, String)>,
     pub closed: bool,
     pub audio_available: bool,
     pub redraw: bool,
@@ -105,6 +107,9 @@ impl AsRef<str> for ChatLine {
 }
 
 impl State {
+    pub fn notify(&mut self, message: String) {
+        self.notice = Some((Instant::now(), message));
+    }
     pub fn send_audio(&self, at: Instant, sample: u64, bytes: Arc<[u8]>) {
         for p in self
             .peers

@@ -275,7 +275,7 @@ export function startCall(room, lifetime, name, status) {
     return room.send(JSON.stringify(p.member), JSON.stringify(p.attempt ? { attempt: p.attempt, signal } : signal));
   }
   function receive(member, update) {
-    if (update === "Query") { room.announce().catch(e => status(e.message)); return; }
+    if (update === "Query") { publishPresence(); return; }
     let p = peers.get(member.session);
     if (update === "Left") {
       if (p) { finish(p, "left"); p.row.remove(); peers.delete(member.session); }
@@ -322,15 +322,20 @@ export function startCall(room, lifetime, name, status) {
       p.label.setAttribute("role", "img");
       connection(p);
       peers.set(member.session, p);
-      if (update.Presence) room.announce().catch(e => status(e.message));
+      if (update.Presence) publishPresence();
     }
     if (update.Presence) p.seen = performance.now();
     if (update.Signal || (update.Presence?.dial && !p.pc)) {
       p.work = p.work.then(() => !lifetime.aborted && !p.ended && signal(p, update)).catch(() => finish(p, "connection failed"));
     }
   }
+  async function publishPresence() {
+    let warning = "";
+    try { await room.announce(); } catch { warning = "Room discovery unavailable"; }
+    if (!lifetime.aborted && $("discovery").textContent !== warning) $("discovery").textContent = warning;
+  }
   async function announce() {
-    try { await room.announce(); } catch (e) { status(e.message); }
+    await publishPresence();
     for (const [id, p] of peers) {
       if (performance.now() - p.seen > 35000 && p.ch?.readyState !== "open") {
         finish(p, "left"); p.row.remove(); peers.delete(id);
@@ -345,6 +350,7 @@ export function startCall(room, lifetime, name, status) {
     mic?.stop();
     audioInfo("");
     clearTimeout(heartbeat);
+    $("discovery").textContent = "";
     for (const p of peers.values()) finish(p, "left");
     mixer?.disconnect();
     player?.pause();

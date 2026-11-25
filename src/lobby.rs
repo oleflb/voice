@@ -59,8 +59,9 @@ impl Lobby {
         self.watchers.push(tokio::spawn(async move {
             let relay = std::env::var("VOICE_RELAY").unwrap_or_default();
             loop {
-                if let Err(e) =
-                    room_session(&room, identity, &relay, interfaces, &mut active, &roster).await
+                if room_session(&room, identity, &relay, interfaces, &mut active, &roster)
+                    .await
+                    .is_err()
                 {
                     roster.send_replace(None);
                     if let Some(call) = active
@@ -68,7 +69,7 @@ impl Lobby {
                         .as_ref()
                         .filter(|c| c.room.secret == room.secret)
                     {
-                        call.state.lock().log(format!("Room signaling: {e}"));
+                        call.state.lock().discovery_unavailable = true;
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {}
@@ -141,7 +142,7 @@ impl Lobby {
                     state.audio_available = false;
                     state.redraw = true;
                     state.set_mic(false);
-                    state.log(format!("Audio unavailable: {e}. Chat is still available."));
+                    state.notify(format!("Audio unavailable: {e}. Chat is still available."));
                 }
             })?;
         self.worker = Some((stop, worker));
@@ -271,9 +272,8 @@ async fn room_session(
             let publisher = room.clone();
             jobs.spawn(async move {
                 loop {
-                    if let Err(e) = publisher.announce().await {
-                        c.state.lock().log(format!("Presence: {e}"));
-                    }
+                    let failed = publisher.announce().await.is_err();
+                    c.state.lock().discovery_unavailable = failed;
                     tokio::time::sleep(Duration::from_secs(8)).await;
                 }
             });
@@ -354,11 +354,8 @@ fn update_peer(
         state.peers.insert(id, p);
         if matches!(update, Update::Presence { .. }) {
             let room = room.clone();
-            let call = call.clone();
             jobs.spawn(async move {
-                if let Err(e) = room.announce().await {
-                    call.state.lock().log(format!("Presence: {e}"));
-                }
+                let _ = room.announce().await;
             });
         }
     }
@@ -476,7 +473,7 @@ fn update_peer(
             p.control = None;
         }
         if let Err(e) = result {
-            state.log(format!("Connection failed: {e}"));
+            state.notify(format!("Connection failed: {e}"));
         }
     });
 }

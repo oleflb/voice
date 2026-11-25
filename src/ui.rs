@@ -528,7 +528,7 @@ impl View {
             Constraint::Length(4),
         ])
         .areas(body);
-        let (audio_available, muted, speech, peers, messages) = {
+        let (audio_available, discovery_unavailable, muted, speech, peers, messages, notice) = {
             let state = call.state.lock();
             let peers = state
                 .peers
@@ -550,10 +550,16 @@ impl View {
                 .collect::<Vec<_>>();
             (
                 state.audio_available,
+                state.discovery_unavailable,
                 *state.muted.borrow(),
                 state.last_speech,
                 peers,
                 state.chat.clone(),
+                state
+                    .notice
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < Duration::from_secs(8))
+                    .map(|(_, msg)| msg.clone()),
             )
         };
         draw_rooms(frame, rooms, Some((&call, &peers)));
@@ -574,7 +580,15 @@ impl View {
                 ]));
             }
             let status = if audio_available { "" } else { " [chat-only]" };
-            let block = self.pane(Pane::People, &format!("{}{status}", call.room.name));
+            let discovery = if discovery_unavailable {
+                " · Room discovery unavailable"
+            } else {
+                ""
+            };
+            let block = self.pane(
+                Pane::People,
+                &format!("{}{status}{discovery}", call.room.name),
+            );
             self.level_area = block.inner(people);
             let selected = self
                 .level_rows
@@ -642,6 +656,14 @@ impl View {
         } else {
             help.into()
         };
+        let [keys, notice_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(u16::from(notice.is_some())),
+        ])
+        .areas(keys);
+        if let Some(notice) = notice {
+            frame.render_widget(Paragraph::new(notice), notice_area);
+        }
         frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), keys);
         if self.focus == Pane::Chat {
             let label = if keys.width > 9 {
@@ -922,7 +944,7 @@ impl View {
                             if let Err(error) = lobby.config.persist() {
                                 call.state
                                     .lock()
-                                    .log(format!("Could not save volume: {error}"));
+                                    .notify(format!("Could not save volume: {error}"));
                             }
                         }
                         _ => {}

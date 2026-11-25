@@ -357,7 +357,7 @@ impl Link {
                     {
                         p.selected_ip = self.selected;
                         if old.is_some_and(|previous| previous != ip) {
-                            state.log(format!("{}: switched to local route {ip}", self.name));
+                            state.notify(format!("{}: switched to local route {ip}", self.name));
                         }
                     }
                 }
@@ -448,16 +448,18 @@ impl Link {
                 .await?;
             Ok(None)
         });
-        let call = self.call.clone();
         let dirty = Arc::new(AtomicBool::new(false));
         let mut retry_candidates = Instant::now();
         let publish = |jobs: &mut JoinSet<Result<Option<Candidate>>>, description| {
-            let (room, member, call) = (room.clone(), member.clone(), call.clone());
+            let (room, member) = (room.clone(), member.clone());
             let dirty = dirty.clone();
             jobs.spawn(async move {
-                if let Err(e) = room.send(&member, Signal::new(attempt, description)).await {
+                if room
+                    .send(&member, Signal::new(attempt, description))
+                    .await
+                    .is_err()
+                {
                     dirty.store(true, Ordering::Relaxed);
-                    call.state.lock().log(format!("ICE signaling: {e}"));
                 }
                 Ok(None)
             });
@@ -523,7 +525,7 @@ impl Link {
                             .call
                             .state
                             .lock()
-                            .log(format!("Cannot upgrade network route: {e}")),
+                            .notify(format!("Cannot upgrade network route: {e}")),
                     }
                 }
             }
@@ -554,7 +556,7 @@ impl Link {
                                 self.routes.push(route);
                                 order += 1;
                             }
-                            Err(e) => self.call.state.lock().log(format!("Cannot add network route: {e}")),
+                            Err(e) => self.call.state.lock().notify(format!("Cannot add network route: {e}")),
                         }
                     }
                     if self.routes.is_empty() { self.lost.get_or_insert(Instant::now()); }
@@ -584,7 +586,7 @@ impl Link {
                         Err(e) => {
                             let route = self.routes.remove(i);
                             route.retire(&mut self.rtc, |s| publish(&mut jobs, s));
-                            self.call.state.lock().log(format!("Local route {}: {e}", route.local));
+                            self.call.state.lock().notify(format!("Local route {}: {e}", route.local));
                             if self.routes.is_empty() { self.lost.get_or_insert(Instant::now()); }
                             continue;
                         }
@@ -668,7 +670,7 @@ pub async fn connect(
         .await
         {
             Ok(route) => routes.push(route),
-            Err(e) => call.state.lock().log(format!("Cannot bind {ip}: {e}")),
+            Err(e) => call.state.lock().notify(format!("Cannot bind {ip}: {e}")),
         }
     }
     ensure!(
