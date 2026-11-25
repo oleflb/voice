@@ -36,6 +36,8 @@ pub struct Peer {
     pub audio_stream: Arc<()>,
     pub control: Option<mpsc::Sender<Command>>,
     pub audio: Option<mpsc::Sender<AudioFrame>>,
+    pub sharing: bool,
+    pub viewer: watch::Sender<Option<mpsc::Sender<crate::video::Frame>>>,
     pub early_ice: Vec<(u32, str0m::Candidate)>,
     pub attempt: u32,
     pub next_retry: Instant,
@@ -72,6 +74,8 @@ impl Peer {
             audio_stream: Arc::new(()),
             control: None,
             audio: None,
+            sharing: false,
+            viewer: watch::Sender::new(None),
             early_ice: Vec::new(),
             attempt: 0,
             next_retry: Instant::now(),
@@ -87,6 +91,7 @@ pub struct Call {
     pub name: String,
     pub started: Instant,
     pub state: Mutex<State>,
+    pub video: crate::video::Video,
 }
 
 #[derive(Default)]
@@ -186,6 +191,7 @@ impl Call {
             room,
             name,
             started: Instant::now(),
+            video: Default::default(),
             state: Mutex::new(State {
                 muted: watch::Sender::new(true),
                 ..Default::default()

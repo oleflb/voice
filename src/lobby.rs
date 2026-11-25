@@ -215,6 +215,7 @@ pub fn depart(
     let call = active.send_replace(None)?;
     let mut state = call.state.lock();
     state.closed = true;
+    call.video.stop();
     let room = state.signaling.take()?;
     Some(async move {
         let _ = tokio::time::timeout(Duration::from_secs(1), room.depart()).await;
@@ -449,6 +450,8 @@ fn update_peer(
     let attempt = p.attempt;
     p.selected_ip = None;
     p.packets.clear();
+    p.sharing = false;
+    p.viewer.send_replace(None);
     p.audio_stream = Arc::new(());
     p.jitter = Default::default();
     let (tx, rx) = mpsc::channel(64);
@@ -465,6 +468,7 @@ fn update_peer(
     let inbox = peer::Inbox {
         control: rx,
         audio: frames,
+        viewer: p.viewer.subscribe(),
     };
     p.status = Status::Connecting;
     let call = call.clone();
@@ -488,6 +492,8 @@ fn update_peer(
             };
             p.control = None;
             p.audio = None;
+            p.sharing = false;
+            p.viewer.send_replace(None);
         }
         if let Err(e) = result {
             state.notify(format!("Connection failed: {e}"));

@@ -8,6 +8,7 @@ mod peer;
 mod shutdown;
 mod stun;
 mod ui;
+mod video;
 
 use anyhow::{Result, bail};
 use config::{Config, Room};

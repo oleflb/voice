@@ -2,6 +2,7 @@ use crate::{
     call::{Call, Status},
     network::Interface,
     stun,
+    video::{self, Frame},
 };
 use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::PublicKey;
@@ -21,13 +22,13 @@ use str0m::{
     Candidate, Event, Input, Output, Rtc,
     change::SdpPendingOffer,
     channel::ChannelId,
-    media::{Direction, Frequency, MediaKind, MediaTime, Mid},
+    media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid},
     net::{Protocol, Receive},
 };
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     task::JoinSet,
 };
 use voice_core::{Description, Member, Message, Room, Signal};
@@ -44,6 +45,7 @@ pub struct AudioFrame(pub Instant, pub u64, pub Arc<[u8]>);
 pub struct Inbox {
     pub control: mpsc::Receiver<Command>,
     pub audio: mpsc::Receiver<AudioFrame>,
+    pub viewer: watch::Receiver<Option<mpsc::Sender<Frame>>>,
 }
 
 pub fn valid(text: &str) -> bool {
@@ -262,6 +264,13 @@ struct Link {
     early: Vec<Candidate>,
     channel: Option<ChannelId>,
     audio: Option<Mid>,
+    video: Option<Mid>,
+    remote_watching: bool,
+    video_out: Option<broadcast::Receiver<Frame>>,
+    video_paused_until: Option<Instant>,
+    send_key: bool,
+    receive_key: bool,
+    last_pli: Option<Instant>,
     call: Arc<Call>,
     session: PublicKey,
     name: String,
@@ -364,6 +373,61 @@ impl Link {
         Ok(())
     }
 
+    fn video_subscription(&mut self, subscribed: bool) {
+        if subscribed == self.video_out.is_some() {
+            return;
+        }
+        self.video_out = subscribed.then(|| self.call.video.frames.subscribe());
+        self.send_key = true;
+        self.call
+            .video
+            .viewers
+            .send_modify(|n| if subscribed { *n += 1 } else { *n -= 1 });
+    }
+
+    fn request_video_key(&mut self) {
+        if self
+            .last_pli
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        if let Some(mut writer) = self.video.and_then(|mid| self.rtc.writer(mid))
+            && writer
+                .request_keyframe(None, KeyframeRequestKind::Pli)
+                .is_ok()
+        {
+            self.last_pli = Some(Instant::now());
+        }
+    }
+
+    fn send_video(&mut self, frame: Frame) {
+        if !*self.call.video.sharing.borrow()
+            || self
+                .video_paused_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        if frame.at.elapsed() > video::MAX_AGE {
+            self.send_key = true;
+        } else if (!self.send_key || frame.key())
+            && let Some(writer) = self.video.and_then(|mid| self.rtc.writer(mid))
+        {
+            let pt = writer.payload_params().next().map(|p| p.pt());
+            if let Some(pt) = pt {
+                self.send_key = writer
+                    .write(
+                        pt,
+                        frame.at,
+                        MediaTime::new(frame.ticks, Frequency::NINETY_KHZ),
+                        frame.data,
+                    )
+                    .is_err();
+            }
+        }
+    }
+
     fn event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::PeerStats(stats) => {
@@ -383,6 +447,28 @@ impl Link {
                 }
             }
             Event::MediaAdded(m) if m.kind == MediaKind::Audio => self.audio = Some(m.mid),
+            Event::MediaAdded(m) if m.kind == MediaKind::Video => self.video = Some(m.mid),
+            Event::MediaEgressStats(stats)
+                if self.video == Some(stats.mid)
+                    && self.video_out.is_some()
+                    && stats.loss.is_some_and(|loss| {
+                        loss >= 0.05
+                            || stats.rtt.zip(self.rtt).is_some_and(|(rtt, ice)| {
+                                rtt.saturating_sub(ice) >= Duration::from_millis(150)
+                            })
+                    })
+                    && self
+                        .video_paused_until
+                        .is_none_or(|until| stats.timestamp >= until) =>
+            {
+                // shortcut: pause and retry at a keyframe, adapt the encoder if pauses are frequent.
+                self.video_paused_until = Some(stats.timestamp + Duration::from_secs(5));
+                self.send_key = true;
+                self.call.state.lock().notify(format!(
+                    "Video paused for {}: network congested. Retrying in 5 seconds.",
+                    self.name
+                ));
+            }
             Event::MediaData(m) if self.audio == Some(m.mid) => {
                 if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
                     && p.attempt == self.attempt
@@ -392,6 +478,35 @@ impl Link {
                         .insert(m.time.numer(), bytes::Bytes::from_owner(m.data));
                     if p.packets.len() > 32 {
                         p.packets.pop_first();
+                    }
+                }
+            }
+            Event::MediaData(m) if self.video == Some(m.mid) => {
+                let viewer = self
+                    .call
+                    .state
+                    .lock()
+                    .peers
+                    .get(&self.session)
+                    .filter(|p| p.attempt == self.attempt && p.sharing)
+                    .and_then(|p| p.viewer.borrow().clone());
+                if let Some(viewer) = viewer {
+                    let frame = Frame {
+                        at: m.network_time,
+                        ticks: m.time.numer(),
+                        data: m.data,
+                    };
+                    self.receive_key |= !m.contiguous;
+                    if frame.data.len() > video::MAX_FRAME
+                        || !frame.valid()
+                        || frame.at.elapsed() > video::MAX_AGE
+                        || (self.receive_key && !frame.key())
+                        || viewer.try_send(frame).is_err()
+                    {
+                        self.receive_key = true;
+                        self.request_video_key();
+                    } else {
+                        self.receive_key = false;
                     }
                 }
             }
@@ -437,6 +552,17 @@ impl Link {
                             p.packets.clear();
                             p.jitter = Default::default();
                         }
+                    }
+                    Ok(Message::Video { sharing, watching }) if self.video.is_some() => {
+                        if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
+                            && p.attempt == self.attempt
+                        {
+                            p.sharing = sharing;
+                            if !sharing {
+                                p.viewer.send_replace(None);
+                            }
+                        }
+                        self.remote_watching = watching && *self.call.video.sharing.borrow();
                     }
                     _ => {}
                 }
@@ -484,6 +610,8 @@ impl Link {
         let mut buffer = [0; 65536];
         let mut mute = self.call.state.lock().muted.subscribe();
         let mut sent_mute = None;
+        let mut share = self.call.video.sharing.subscribe();
+        let mut sent_video = None;
         let mut order = self.routes.len();
         while self.rtc.is_alive() && !inbox.control.is_closed() {
             let deadline = loop {
@@ -494,6 +622,29 @@ impl Link {
                     && self.try_send(Message::Mute { muted })?
                 {
                     sent_mute = Some(muted);
+                }
+                let (can_send, can_receive) = self
+                    .video
+                    .and_then(|mid| self.rtc.media(mid))
+                    .map(|m| (m.direction().is_sending(), m.direction().is_receiving()))
+                    .unwrap_or_default();
+                let sharing = *share.borrow_and_update() && can_send;
+                let watching = inbox.viewer.borrow_and_update().is_some() && can_receive;
+                if !sharing {
+                    self.remote_watching = false;
+                }
+                self.video_subscription(sharing && self.remote_watching && self.lost.is_none());
+                if (can_send || can_receive)
+                    && self.channel.is_some()
+                    && sent_video != Some((sharing, watching))
+                    && self.try_send(Message::Video { sharing, watching })?
+                {
+                    if watching && !sent_video.is_some_and(|(_, watching)| watching) {
+                        self.receive_key = true;
+                        self.last_pli = None;
+                        self.request_video_key();
+                    }
+                    sent_video = Some((sharing, watching));
                 }
                 match self.rtc.poll_output()? {
                     Output::Timeout(t) => break t,
@@ -554,6 +705,17 @@ impl Link {
             };
             tokio::select! {
                 _ = mute.changed() => {}
+                _ = share.changed() => {}
+                _ = inbox.viewer.changed() => {}
+                frame = async {
+                    match self.video_out.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match frame {
+                    Ok(frame) => self.send_video(frame),
+                    Err(_) => self.send_key = true,
+                },
                 changed = network.changed() => {
                     changed?;
                     let interfaces = network.borrow_and_update().clone();
@@ -631,6 +793,7 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
+        self.video_subscription(false);
         // Leaving cancels this task. Flush any already-queued close notifications
         // before the socket disappears so remote peers needn't wait for ICE expiry.
         if self.rtc.close().is_ok() {
@@ -654,6 +817,7 @@ pub(crate) fn new_rtc(now: Instant) -> Rtc {
         .set_stats_interval(Some(Duration::from_secs(1)))
         .clear_codecs()
         .enable_opus(true, false)
+        .enable_vp8(true)
         // The mixer owns the playout deadline, including reordering and loss concealment.
         .set_reordering_size_audio(0)
         .build(now)
@@ -694,11 +858,15 @@ pub async fn connect(
     );
     let mut api = rtc.sdp_api();
     let mut audio = None;
+    let mut video = None;
     let (description, pending) = if let Some(offer) = offer {
         let answer = api.accept_offer(serde_json::from_str(&offer)?)?;
         (Description::Answer(serde_json::to_string(&answer)?), None)
     } else {
         audio = Some(api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None));
+        if member.video {
+            video = Some(api.add_media(MediaKind::Video, Direction::SendRecv, None, None, None));
+        }
         api.add_channel("voice".into());
         let Some((offer, pending)) = api.apply() else {
             bail!("No offer generated");
@@ -719,6 +887,13 @@ pub async fn connect(
         early: Vec::new(),
         channel: None,
         audio,
+        video,
+        remote_watching: false,
+        video_out: None,
+        video_paused_until: None,
+        send_key: true,
+        receive_key: true,
+        last_pli: None,
         call,
         session: member.session,
         name: member.name.clone(),

@@ -127,6 +127,7 @@ struct PeerRow {
     id: nostr_sdk::PublicKey,
     name: String,
     connection: char,
+    sharing: bool,
     muted: bool,
     local_mute: bool,
     volume: f32,
@@ -136,10 +137,11 @@ struct PeerRow {
 impl PeerRow {
     fn label(&self) -> Span<'static> {
         let label = Span::raw(format!(
-            "{} {} {}",
+            "{} {} {}{}",
             self.name,
             indicator(self.muted, self.last_speech),
-            self.connection
+            self.connection,
+            if self.sharing { " · sharing" } else { "" }
         ));
         if self.connection == ' ' {
             label
@@ -544,6 +546,7 @@ impl View {
                             [(call.started.elapsed().as_millis() / 150 % 10) as usize],
                     },
                     muted: p.muted,
+                    sharing: p.sharing,
                     local_mute: p.local_mute,
                     volume: p.volume,
                     last_speech: p.last_speech,
