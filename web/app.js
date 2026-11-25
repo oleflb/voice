@@ -65,11 +65,10 @@ async function openRoom(active) {
     }, { once: true });
     start();
     if (!active) {
-      const roster = preview();
+      const roster = preview(room, e => { if (!active) report(e.message); });
       receive = roster.receive;
       rosterTimer = setInterval(roster.draw, 5000);
       signal.addEventListener("abort", () => clearInterval(rosterTimer), { once: true });
-      room.query().catch(e => report(e.message));
     }
     while (!signal.aborted) {
       const [member, update] = JSON.parse(await room.next());
@@ -82,9 +81,18 @@ async function openRoom(active) {
   }
 }
 
-function preview() {
+function preview(room, queryFailed) {
   const roster = new Map();
+  let available = false;
   function draw() {
+    if (!room.presence_available()) {
+      available = false;
+      roster.clear();
+      $("roster").textContent = "Presence unavailable";
+      return;
+    }
+    if (!available) room.query().catch(queryFailed);
+    available = true;
     for (const [id, entry] of roster) if (entry.until < Date.now()) roster.delete(id);
     $("roster").textContent = [...roster.values()].map(p => p.name).sort().join(", ") || "No one seen yet";
   }

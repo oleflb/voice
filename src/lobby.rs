@@ -243,7 +243,7 @@ async fn room_session(
     let (network, _) = watch::channel(Vec::new());
     let mut previous = Vec::new();
     let mut call = None;
-    let mut first = true;
+    let mut available = false;
     loop {
         let wanted = active
             .borrow_and_update()
@@ -277,18 +277,19 @@ async fn room_session(
                     tokio::time::sleep(Duration::from_secs(8)).await;
                 }
             });
-        } else if first {
-            let room = room.clone();
-            jobs.spawn(async move {
-                let _ = room.query().await;
-            });
         }
-        first = false;
         tokio::select! {
             changed = active.changed() => { changed?; }
             _ = tick.tick() => {
+                let connected = room.presence_available();
+                if connected && !available {
+                    let room = room.clone();
+                    jobs.spawn(async move { let _ = room.query().await; });
+                }
+                available = connected;
+                if !available { names.clear(); }
                 names.retain(|_, (_, at): &mut (String, Instant)| at.elapsed() < Duration::from_secs(35));
-                roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
+                roster.send_replace(available.then(|| names.values().map(|(name, _)| name.clone()).collect()));
                 if let Some(c) = &call {
                     if let Ok(current) = bind_ips() {
                         network.send_modify(|published| {
@@ -324,7 +325,9 @@ async fn room_session(
                 } else if matches!(update, Update::Presence{..}) && (names.len() < 64 || names.contains_key(&member.session)) {
                     names.insert(member.session, (member.name.clone(), Instant::now()));
                 }
-                roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
+                if available && room.presence_available() {
+                    roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
+                }
                 if matches!(update, Update::Left) { continue; }
                 if let Some(c) = &call { update_peer(c, &room, member, update, &network, &mut jobs); }
             }

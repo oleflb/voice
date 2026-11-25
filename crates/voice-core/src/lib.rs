@@ -124,6 +124,7 @@ pub struct Room {
     identity: Keys,
     session: Keys,
     client: Client,
+    presence_relays: Vec<Relay>,
     events: Mutex<(
         broadcast::Receiver<RelayPoolNotification>,
         std::collections::BTreeMap<PublicKey, Timestamp>,
@@ -159,25 +160,45 @@ impl Room {
             })
             .collect::<FuturesUnordered<_>>();
         while !ready.next().await.context("No signaling relay reachable")? {}
-        for filter in [
-            Filter::new()
-                .kinds([READY, QUERY, LEFT])
-                .identifier(room.public_key().to_hex()),
-            Filter::new().kind(SIGNAL).pubkey(session.public_key()),
-        ] {
+        let subscribe = async |filter: Filter| -> Result<_> {
             let output = client
                 .subscribe(filter.since(Timestamp::now()).limit(8), None)
                 .await?;
             ensure!(!output.success.is_empty(), "Room subscription failed");
-        }
+            Ok(output.success)
+        };
+        let subscribed = subscribe(
+            Filter::new()
+                .kinds([READY, QUERY, LEFT])
+                .identifier(room.public_key().to_hex()),
+        )
+        .await?;
+        let presence_relays = client
+            .relays()
+            .await
+            .into_iter()
+            .filter_map(|(url, relay)| subscribed.contains(&url).then_some(relay))
+            .collect();
+        subscribe(Filter::new().kind(SIGNAL).pubkey(session.public_key())).await?;
         Ok(Self {
             name: std::sync::RwLock::new(name.to_owned()),
             room,
             identity,
             session,
             client,
+            presence_relays,
             events: Mutex::new((events, Default::default())),
         })
+    }
+
+    pub fn presence_available(&self) -> bool {
+        self.presence_relays
+            .iter()
+            .any(|r| r.status() == RelayStatus::Connected)
+    }
+
+    pub fn dials(&self, peer: PublicKey) -> bool {
+        self.session.public_key() < peer
     }
 
     // The relay sees a fresh session key. Only invite holders can read or create a
@@ -290,7 +311,7 @@ impl Room {
                     if departed.contains_key(&event.pubkey) {
                         continue;
                     }
-                    let dial = self.session.public_key() < event.pubkey;
+                    let dial = self.dials(event.pubkey);
                     if [READY, QUERY, LEFT].contains(&event.kind)
                         && let Some(member) = self.member(&event.content, event.pubkey)
                     {
@@ -398,6 +419,9 @@ mod web {
 
     #[wasm_bindgen]
     impl WebRoom {
+        pub fn presence_available(&self) -> bool {
+            self.0.presence_available()
+        }
         pub async fn close(&self) {
             self.0.client.shutdown().await;
         }
