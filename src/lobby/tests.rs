@@ -19,7 +19,7 @@ async fn lobby_connects_peers_delivers_chat_and_handles_departure() -> Result<()
                 &room,
                 identity,
                 &url,
-                || Ok(std::net::Ipv4Addr::LOCALHOST.into()),
+                || Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into()]),
                 &mut wanted,
                 &roster,
             )

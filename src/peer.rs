@@ -1,14 +1,20 @@
 use crate::{
-    network::Interface,
     call::{Call, Status},
+    network::Interface,
     stun,
 };
 use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::PublicKey;
 use std::{
     collections::BTreeSet,
+    future::poll_fn,
+    io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
     time::{Duration, Instant},
 };
 use str0m::{
@@ -18,7 +24,12 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, MediaTime, Mid},
     net::{Protocol, Receive},
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
+use tokio::{
+    io::ReadBuf,
+    net::UdpSocket,
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 use voice_core::{Description, Member, Message, Room, Signal};
 
 pub enum Command {
@@ -87,8 +98,21 @@ impl Route {
 
 }
 
+async fn receive(routes: &[Route], buf: &mut [u8]) -> (usize, io::Result<(SocketAddr, usize)>) {
+    poll_fn(|cx| {
+        let mut buf = ReadBuf::new(buf);
+        for (i, route) in routes.iter().enumerate() {
+            if let Poll::Ready(result) = route.socket.poll_recv_from(cx, &mut buf) {
+                return Poll::Ready((i, result.map(|source| (source, buf.filled().len()))));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 struct Link {
-    route: Route,
+    routes: Vec<Route>,
     rtc: Rtc,
     offer: Option<SdpPendingOffer>,
     early: Vec<Candidate>,
@@ -96,9 +120,12 @@ struct Link {
     audio: Option<Mid>,
     call: Arc<Call>,
     session: PublicKey,
-    attempt: u32,
     pending: BTreeSet<u32>,
     name: String,
+    attempt: u32,
+    lost: Option<Instant>,
+    selected: Option<IpAddr>,
+    rtt: Option<Duration>,
 }
 
 impl Link {
@@ -112,7 +139,16 @@ impl Link {
 
     fn command(&mut self, command: Command) -> Result<()> {
         match command {
-            Command::Remove(candidate) => { self.rtc.direct_api().invalidate_candidate(&candidate); }
+            Command::Remove(candidate) => {
+                if !self
+                    .routes
+                    .iter()
+                    .flat_map(|r| &r.candidates)
+                    .any(|c| c.addr() == candidate.addr())
+                {
+                    self.rtc.direct_api().invalidate_candidate(&candidate);
+                }
+            }
             Command::Answer(sdp) => {
                 if let Some(offer) = self.offer.take() {
                     self.rtc
@@ -172,6 +208,22 @@ impl Link {
 
     fn event(&mut self, event: Event) -> Result<()> {
         match event {
+            Event::PeerStats(stats) => {
+                if let Some(pair) = stats.selected_candidate_pair {
+                    self.rtt = pair.current_round_trip_time;
+                    let ip = pair.local.addr.ip();
+                    let old = self.selected.replace(ip);
+                    let mut state = self.call.state.lock();
+                    if let Some(p) = state.peers.get_mut(&self.session)
+                        && p.attempt == self.attempt
+                    {
+                        p.selected_ip = self.selected;
+                        if old.is_some_and(|previous| previous != ip) {
+                            state.log(format!("{}: switched to local route {ip}", self.name));
+                        }
+                    }
+                }
+            }
             Event::MediaAdded(m) if m.kind == MediaKind::Audio => self.audio = Some(m.mid),
             Event::MediaData(m) if self.audio == Some(m.mid) => {
                 if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
@@ -196,8 +248,9 @@ impl Link {
             }
             Event::ChannelClose(id) if self.channel == Some(id) => self.rtc.disconnect(),
             Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected) => {
-                self.rtc.disconnect()
+                self.lost.get_or_insert(Instant::now());
             }
+            Event::IceConnectionStateChange(s) if s.is_connected() => self.lost = None,
             Event::ChannelData(d)
                 if self.channel == Some(d.id) && !d.binary && d.data.len() <= 16384 =>
             {
@@ -245,21 +298,37 @@ impl Link {
         room: Arc<Room>,
         member: Member,
         description: Description,
+        mut network: watch::Receiver<Vec<Interface>>,
         mut jobs: JoinSet<Result<Option<Candidate>>>,
     ) -> Result<()> {
-        let local = self.route.local;
         let attempt = self.attempt;
         let publisher = room.clone();
         let recipient = member.clone();
         jobs.spawn(async move {
-            publisher.send(&recipient, Signal::new(attempt, description)).await?;
+            publisher
+                .send(&recipient, Signal::new(attempt, description))
+                .await?;
             Ok(None)
         });
+        let call = self.call.clone();
+        let dirty = Arc::new(AtomicBool::new(false));
+        let mut retry_candidates = Instant::now();
+        let publish = |jobs: &mut JoinSet<Result<Option<Candidate>>>, description| {
+            let (room, member, call) = (room.clone(), member.clone(), call.clone());
+            let dirty = dirty.clone();
+            jobs.spawn(async move {
+                if let Err(e) = room.send(&member, Signal::new(attempt, description)).await {
+                    dirty.store(true, Ordering::Relaxed);
+                    call.state.lock().log(format!("ICE signaling: {e}"));
+                }
+                Ok(None)
+            });
+        };
         let started = Instant::now();
         let mut buffer = [0; 65536];
         let mut mute = self.call.state.lock().muted.subscribe();
         let mut sent_mute = None;
-        while self.rtc.is_alive() {
+        while self.rtc.is_alive() && !commands.is_closed() {
             let deadline = loop {
                 let muted = *mute.borrow_and_update();
                 // Keep the latest state pending if SCTP is temporarily full.
@@ -272,7 +341,10 @@ impl Link {
                 match self.rtc.poll_output()? {
                     Output::Timeout(t) => break t,
                     Output::Transmit(tx) => {
-                        self.route.socket.send_to(&tx.contents, tx.destination).await?;
+                        if let Some(route) = self.routes.iter_mut().find(|r| r.local == tx.source) {
+                            // One unreachable ICE candidate pair must not abort checks on the others.
+                            let _ = route.socket.send_to(&tx.contents, tx.destination).await;
+                        }
                     }
                     Output::Event(event) => self.event(event)?,
                 }
@@ -284,27 +356,65 @@ impl Link {
             } else {
                 deadline
             };
+            let deadline = if let Some(lost) = self.lost {
+                let limit = lost + Duration::from_secs(8);
+                ensure!(Instant::now() < limit, "ICE path lost");
+                deadline.min(limit)
+            } else {
+                deadline
+            };
             tokio::select! {
                 _ = mute.changed() => {}
-                Some(result) = jobs.join_next(), if !jobs.is_empty() => {
-                    if let Some(candidate) = result?? && let Some(added) = self.rtc.add_local_candidate(candidate) {
-                        let line = added.to_sdp_string();
-                        // A redundant route failing to publish must not close a working call.
-                        let (room, member, call) = (room.clone(), member.clone(), self.call.clone());
-                        jobs.spawn(async move {
-                            if let Err(e) = room.send(&member, Signal::new(attempt, Description::Ice(line))).await {
-                                call.state.lock().log(format!("ICE signaling: {e}"));
+                changed = network.changed() => {
+                    changed?;
+                    let interfaces = network.borrow_and_update().clone();
+                    self.routes.retain(|r| {
+                        if interfaces.contains(&r.interface) { return true; }
+                        r.retire(&mut self.rtc, |s| publish(&mut jobs, s));
+                        false
+                    });
+                    for interface in interfaces {
+                        if self.routes.iter().any(|r| r.interface == interface) { continue; }
+                        match Route::open(interface, &mut self.rtc, &mut jobs, self.call.clone()).await {
+                            Ok(route) => {
+                                publish(&mut jobs, Description::Ice(route.candidates[0].to_sdp_string()));
+                                self.routes.push(route);
                             }
-                            Ok(None)
-                        });
+                            Err(e) => self.call.state.lock().log(format!("Cannot add network route: {e}")),
+                        }
+                    }
+                    if self.routes.is_empty() { self.lost.get_or_insert(Instant::now()); }
+                    if Instant::now() >= retry_candidates && dirty.swap(false, Ordering::Relaxed) {
+                        retry_candidates = Instant::now() + Duration::from_secs(8);
+                        for r in &self.routes {
+                            for c in &r.candidates { publish(&mut jobs, Description::Ice(c.to_sdp_string())); }
+                        }
+                    }
+                }
+                Some(result) = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(candidate) = result?? && let Some(r) = self.routes.iter_mut().find(|r| r.local == candidate.local()) {
+                        if let Some(added) = self.rtc.add_local_candidate(candidate) {
+                            publish(&mut jobs, Description::Ice(added.to_sdp_string()));
+                            r.candidates.push(added.clone());
+                        }
                     }
                 }
                 cmd = commands.recv() => match cmd { Some(cmd) => self.command(cmd)?, None => break },
-                incoming = self.route.socket.recv_from(&mut buffer) => {
-                    let (n, source) = incoming?;
-                    if self.route.binding.receive(source, &buffer[..n]) { continue; }
+                (i, incoming) = receive(&self.routes, &mut buffer) => {
+                    let (source, n) = match incoming {
+                        Ok(packet) => packet,
+                        Err(e) => {
+                            let route = self.routes.remove(i);
+                            route.retire(&mut self.rtc, |s| publish(&mut jobs, s));
+                            self.call.state.lock().log(format!("Local route {}: {e}", route.local));
+                            if self.routes.is_empty() { self.lost.get_or_insert(Instant::now()); }
+                            continue;
+                        }
+                    };
+                    let route = &mut self.routes[i];
+                    if route.binding.receive(source, &buffer[..n]) { continue; }
                     if let Ok(contents) = buffer[..n].try_into() {
-                        self.rtc.handle_input(Input::Receive(Instant::now(),Receive{proto:Protocol::Udp, source,destination:local,contents}))?;
+                        self.rtc.handle_input(Input::Receive(Instant::now(),Receive{proto:Protocol::Udp, source,destination:self.routes[i].local,contents}))?;
                     }
                 }
                 _ = tokio::time::sleep_until(deadline.into()) => self.rtc.handle_input(Input::Timeout(Instant::now()))?,
@@ -322,7 +432,9 @@ impl Drop for Link {
             while let Ok(output) = self.rtc.poll_output() {
                 match output {
                     Output::Transmit(tx) => {
-                        let _ = self.route.socket.try_send_to(&tx.contents, tx.destination);
+                        if let Some(route) = self.routes.iter().find(|r| r.local == tx.source) {
+                            let _ = route.socket.try_send_to(&tx.contents, tx.destination);
+                        }
                     }
                     Output::Timeout(_) => break,
                     Output::Event(_) => {}
@@ -340,6 +452,7 @@ impl Drop for Link {
 
 pub(crate) fn new_rtc(now: Instant) -> Rtc {
     Rtc::builder()
+        .set_stats_interval(Some(Duration::from_secs(1)))
         .clear_codecs()
         .enable_opus(true, false)
         // The mixer owns the playout deadline, including reordering and loss concealment.
@@ -348,7 +461,7 @@ pub(crate) fn new_rtc(now: Instant) -> Rtc {
 }
 
 pub async fn connect(
-    ip: IpAddr,
+    mut network: watch::Receiver<Vec<Interface>>,
     room: Arc<Room>,
     member: Member,
     offer: Option<String>,
@@ -357,8 +470,27 @@ pub async fn connect(
     commands: mpsc::Receiver<Command>,
 ) -> Result<()> {
     let mut rtc = new_rtc(Instant::now());
+    let mut routes = Vec::new();
     let mut jobs = JoinSet::new();
-    let route = Route::open(ip.into(), &mut rtc, &mut jobs, call.clone()).await?;
+    let interfaces = network.borrow_and_update().clone();
+    for interface in interfaces {
+        let ip = interface.ip;
+        match Route::open(
+            interface,
+            &mut rtc,
+            &mut jobs,
+            call.clone(),
+        )
+        .await
+        {
+            Ok(route) => routes.push(route),
+            Err(e) => call.state.lock().log(format!("Cannot bind {ip}: {e}")),
+        }
+    }
+    ensure!(
+        !routes.is_empty(),
+        "No usable local UDP address; check VOICE_BIND_IP"
+    );
     let mut api = rtc.sdp_api();
     let mut audio = None;
     let (description, pending) = if let Some(offer) = offer {
@@ -376,7 +508,11 @@ pub async fn connect(
         )
     };
     let mut link = Link {
-        route,
+        routes,
+        attempt,
+        lost: None,
+        selected: None,
+        rtt: None,
         rtc,
         offer: pending,
         early: Vec::new(),
@@ -384,9 +520,9 @@ pub async fn connect(
         audio,
         call,
         session: member.session,
-        attempt,
         pending: BTreeSet::new(),
         name: member.name.clone(),
     };
-    link.drive(commands, room, member, description, jobs).await
+    link.drive(commands, room, member, description, network, jobs)
+        .await
 }

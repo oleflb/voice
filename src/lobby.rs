@@ -1,3 +1,4 @@
+use crate::network::{Interface, interfaces};
 use crate::{
     audio,
     call::{Call, Peer, Status},
@@ -8,7 +9,6 @@ use anyhow::{Context, Result};
 use nostr_sdk::SecretKey;
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -60,7 +60,7 @@ impl Lobby {
             let relay = std::env::var("VOICE_RELAY").unwrap_or_default();
             loop {
                 if let Err(e) =
-                    room_session(&room, identity, &relay, interface, &mut active, &roster).await
+                    room_session(&room, identity, &relay, interfaces, &mut active, &roster).await
                 {
                     roster.send_replace(None);
                     if let Some(call) = active
@@ -220,23 +220,11 @@ pub fn depart(
     })
 }
 
-fn interface() -> Result<IpAddr> {
-    if let Ok(ip) = std::env::var("VOICE_BIND_IP") {
-        return Ok(ip.parse()?);
-    }
-    // UDP connect selects the default route without sending a datagram.
-    let probe = UdpSocket::bind("0.0.0.0:0")?;
-    probe
-        .connect("192.0.2.1:9")
-        .context("No default IPv4 route; set VOICE_BIND_IP")?;
-    Ok(probe.local_addr()?.ip())
-}
-
 async fn room_session(
     saved: &Room,
     identity: [u8; 32],
     relay: &str,
-    bind_ip: fn() -> Result<IpAddr>,
+    bind_ips: fn() -> Result<Vec<Interface>>,
     active: &mut watch::Receiver<Option<Arc<Call>>>,
     roster: &watch::Sender<Option<Vec<String>>>,
 ) -> Result<()> {
@@ -252,7 +240,8 @@ async fn room_session(
     let mut jobs = JoinSet::new();
     let mut names = BTreeMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
-    let mut listening = true;
+    let (network, _) = watch::channel(Vec::new());
+    let mut previous = Vec::new();
     let mut call = None;
     let mut first = true;
     loop {
@@ -268,6 +257,8 @@ async fn room_session(
         if call.is_none()
             && let Some(c) = wanted
         {
+            previous = bind_ips()?;
+            network.send_replace(previous.clone());
             room.set_name(&c.name)?;
             {
                 let mut state = c.state.lock();
@@ -299,18 +290,26 @@ async fn room_session(
                 names.retain(|_, (_, at): &mut (String, Instant)| at.elapsed() < Duration::from_secs(35));
                 roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
                 if let Some(c) = &call {
+                    if let Ok(current) = bind_ips() {
+                        network.send_modify(|published| {
+                            // Retire vanished paths immediately; debounce additions while a fallback exists.
+                            let has_route = published.iter().any(|i| current.contains(i));
+                            // Republish stable snapshots too, so a temporarily unbindable NIC gets retried.
+                            *published = current.iter().filter(|i| !has_route || previous.contains(i)).cloned().collect();
+                        });
+                        previous = current;
+                    }
                     c.state.lock().peers.retain(|_, p| p.status == Status::Connected || p.seen.elapsed() < Duration::from_secs(35));
                 }
             }
-            update = room.next(), if listening => {
+            update = room.next() => {
                 let (member, update) = match update {
                     Ok(event) => event,
-                    Err(e) if let Some(c) = &call => {
-                        c.state.lock().log(format!("Room signaling stopped: {e}"));
-                        listening = false;
-                        continue;
+                    Err(e) => {
+                        // The relay SDK handles transient disconnects; a closed receiver needs a fresh session.
+                        if let Some(c) = &call { c.state.lock().peers.clear(); }
+                        return Err(e);
                     }
-                    Err(e) => return Err(e),
                 };
                 if matches!(update, Update::Query) {
                     if call.is_some() {
@@ -327,7 +326,7 @@ async fn room_session(
                 }
                 roster.send_replace(Some(names.values().map(|(name, _)| name.clone()).collect()));
                 if matches!(update, Update::Left) { continue; }
-                if let Some(c) = &call { update_peer(c, &room, member, update, bind_ip, &mut jobs); }
+                if let Some(c) = &call { update_peer(c, &room, member, update, &network, &mut jobs); }
             }
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {}
         }
@@ -339,7 +338,7 @@ fn update_peer(
     room: &Arc<voice_core::Room>,
     member: Member,
     update: Update,
-    bind_ip: fn() -> Result<IpAddr>,
+    network: &watch::Sender<Vec<Interface>>,
     jobs: &mut JoinSet<()>,
 ) {
     let mut state = call.state.lock();
@@ -455,8 +454,9 @@ fn update_peer(
     p.status = Status::Connecting;
     let call = call.clone();
     let room = room.clone();
+    let network = network.subscribe();
     jobs.spawn(async move {
-        let result = async { peer::connect(bind_ip()?, room, member, offer, attempt, call.clone(), rx).await }.await;
+        let result = peer::connect(network, room, member, offer, attempt, call.clone(), rx).await;
         let mut state = call.state.lock();
         if let Some(p) = state.peers.get_mut(&id)
             && p.control
