@@ -569,8 +569,19 @@ impl View {
         draw_rooms(frame, rooms, Some((&call, &peers)));
         {
             self.level_rows.push(LevelRow::Me);
-            let mut lines =
-                vec![Line::from(format!("{} {}", call.name, indicator(muted, speech))).bold()];
+            let sharing = if *call.video.sharing.borrow() {
+                " · sharing desktop (s to stop)"
+            } else {
+                ""
+            };
+            let mut lines = vec![
+                Line::from(format!(
+                    "{} {}{sharing}",
+                    call.name,
+                    indicator(muted, speech)
+                ))
+                .bold(),
+            ];
             for peer in &peers {
                 self.level_rows.push(LevelRow::Peer(peer.id));
                 let local = if peer.local_mute {
@@ -646,13 +657,13 @@ impl View {
                 "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nm enable mic · t chat · Esc leave · q quit"
             }
             Pane::People if !audio_available => {
-                "Alt+arrows/hjkl focus · arrows/hjkl select · m enable mic · t chat\nv watch · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · arrows/hjkl select · m enable mic · t chat\nv watch · s share desktop · Esc leave · q quit"
             }
             Pane::Sessions => {
                 "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nt chat · m mic mute · Esc leave · q quit"
             }
             Pane::People => {
-                "Alt+arrows/hjkl focus · hover or arrows/hjkl select · +/- selected level\nx mute participant · m mic mute · t chat · v watch · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · hover or arrows/hjkl select · +/- selected level\nx mute participant · m mic mute · t chat · v watch · s share desktop · Esc leave · q quit"
             }
         };
         let help = if self.focus == Pane::Chat && !self.chat_input.error.is_empty() {
@@ -893,6 +904,11 @@ impl View {
             }
             KeyCode::Char('n') => self.edit(Form::RoomName),
             KeyCode::Char('i') => self.edit(Form::Import),
+            KeyCode::Char('s') if self.focus == Pane::People && active.is_some() => {
+                if event.kind == KeyEventKind::Press {
+                    crate::video::toggle(active.as_ref().unwrap());
+                }
+            }
             KeyCode::Char('s') => {
                 if let Some(room) = lobby.config.rooms.get(self.room) {
                     self.edit(Form::Share(room.invite()?));

@@ -14,6 +14,32 @@ pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 pub const MAX_AGE: Duration = Duration::from_millis(200);
 pub const QUEUE: usize = 4;
 
+#[cfg(target_os = "linux")]
+pub(crate) const VP8_PIPELINE: &[&str] = &[
+    "!",
+    "videorate",
+    "max-rate=30",
+    "!",
+    "videoconvertscale",
+    "add-borders=true",
+    "!",
+    "video/x-raw,format=I420,width=1920,height=1080,pixel-aspect-ratio=1/1",
+    "!",
+    "vp8enc",
+    "deadline=1",
+    "cpu-used=8",
+    "threads=4",
+    "lag-in-frames=0",
+    "target-bitrate=5000000",
+    "keyframe-max-dist=15",
+    "!",
+    "gdppay",
+    "!",
+    "fdsink",
+    "fd=1",
+    "sync=false",
+];
+
 #[derive(Clone)]
 pub struct Frame {
     pub at: Instant,
@@ -44,6 +70,8 @@ pub struct Video {
     pub sharing: watch::Sender<bool>,
     pub viewers: watch::Sender<usize>,
     pub frames: broadcast::Sender<Frame>,
+    #[cfg(target_os = "linux")]
+    capture: parking_lot::Mutex<Option<watch::Sender<bool>>>,
 }
 
 impl Default for Video {
@@ -52,13 +80,31 @@ impl Default for Video {
             sharing: watch::Sender::new(false),
             viewers: watch::Sender::new(0),
             frames: broadcast::Sender::new(QUEUE),
+            #[cfg(target_os = "linux")]
+            capture: Default::default(),
         }
     }
 }
 
 impl Video {
     pub fn stop(&self) {
+        #[cfg(target_os = "linux")]
+        let capture = self.capture.lock();
         self.sharing.send_replace(false);
+        #[cfg(target_os = "linux")]
+        if let Some(stop) = capture.as_ref() {
+            stop.send_replace(true);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn announce_share(&self) -> bool {
+        let capture = self.capture.lock();
+        if capture.as_ref().is_none_or(|stop| *stop.borrow()) {
+            return false;
+        }
+        self.sharing.send_replace(true);
+        true
     }
 }
 
@@ -274,9 +320,234 @@ async fn write_ivf(
     Ok(())
 }
 
+pub fn toggle(call: &Arc<crate::call::Call>) {
+    #[cfg(not(target_os = "linux"))]
+    call.state
+        .lock()
+        .notify("Desktop sharing requires Linux and a ScreenCast portal".into());
+    #[cfg(target_os = "linux")]
+    {
+        let mut capture = call.video.capture.lock();
+        if let Some(stop) = capture.as_ref() {
+            call.video.sharing.send_replace(false);
+            stop.send_replace(true);
+            return;
+        }
+        let (stop, quit) = watch::channel(false);
+        *capture = Some(stop);
+        let call = call.clone();
+        tokio::spawn(async move {
+            let result = capture_desktop(&call, quit).await;
+            call.video.sharing.send_replace(false);
+            *call.video.capture.lock() = None;
+            call.state.lock().notify(match result {
+                Ok(()) => "Desktop sharing stopped".into(),
+                Err(error) => format!("Desktop sharing: {error:#}"),
+            });
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn capture_desktop(call: &crate::call::Call, mut stop: watch::Receiver<bool>) -> Result<()> {
+    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    let portal = Screencast::new()
+        .await
+        .context("ScreenCast portal unavailable")?;
+    let session = portal.create_session(Default::default()).await?;
+    let capture = async {
+        let sources =
+            portal.available_source_types().await? & (SourceType::MONITOR | SourceType::WINDOW);
+        ensure!(
+            !sources.is_empty(),
+            "The portal does not offer screens or windows"
+        );
+        let mut options = SelectSourcesOptions::default().set_sources(sources);
+        if portal
+            .available_cursor_modes()
+            .await
+            .is_ok_and(|m| m.contains(CursorMode::EMBEDDED))
+        {
+            options = options.set_cursor_mode(CursorMode::EMBEDDED);
+        }
+        portal.select_sources(&session, options).await?.response()?;
+        let streams = portal
+            .start(&session, None, Default::default())
+            .await?
+            .response()?;
+        let node = streams
+            .streams()
+            .first()
+            .context("No screen selected")?
+            .pipe_wire_node_id();
+        let mut viewers = call.video.viewers.subscribe();
+        let mut closed = session.receive_closed().await?;
+        {
+            let mut state = call.state.lock();
+            if state.closed || !call.video.announce_share() {
+                return Ok(());
+            }
+            state.notify("Desktop sharing is available to viewers".into());
+        }
+        loop {
+            tokio::select! {
+                _ = futures_util::StreamExt::next(&mut closed) => return Ok(()),
+                ready = viewers.wait_for(|n| *n != 0) => { ready?; }
+            }
+            let fd = portal
+                .open_pipe_wire_remote(&session, Default::default())
+                .await?;
+            // shortcut: repeat idle frames to bound the next keyframe without restarting
+            // the encoder; replace the keepalive with on-demand refresh if idle CPU matters.
+            let mut command = Command::new("gst-launch-1.0");
+            command
+                .args([
+                    "-q",
+                    "pipewiresrc",
+                    "fd=0",
+                    &format!("path={node}"),
+                    "do-timestamp=true",
+                    "keepalive-time=100",
+                ])
+                .args(VP8_PIPELINE)
+                .stdin(Stdio::from(fd));
+            tokio::select! {
+                _ = futures_util::StreamExt::next(&mut closed) => return Ok(()),
+                idle = viewers.wait_for(|n| *n == 0) => { idle?; }
+                result = run_encoder(command, &call.video.frames, call.started) => return result,
+            }
+        }
+    };
+    let result = tokio::select! {
+        _ = stop.wait_for(|stop| *stop) => Ok(()),
+        result = capture => result,
+    };
+    call.video.sharing.send_replace(false);
+    let _ = session.close().await;
+    result
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn run_encoder(
+    mut command: Command,
+    frames: &broadcast::Sender<Frame>,
+    started: Instant,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Could not start gst-launch-1.0")?;
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (result, tail) = tokio::join!(
+        async {
+            let result = read_gdp(stdout, frames, started).await;
+            if tokio::time::timeout(Duration::from_millis(200), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+            }
+            result
+        },
+        async {
+            let mut tail = Vec::new();
+            let mut buf = [0; 1024];
+            while let Ok(n @ 1..) = stderr.read(&mut buf).await {
+                tail.extend_from_slice(&buf[..n]);
+                tail.drain(..tail.len().saturating_sub(2048));
+            }
+            tail
+        }
+    );
+    let tail: String = String::from_utf8_lossy(&tail)
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .collect();
+    if tail.trim().is_empty() {
+        result
+    } else {
+        result.context(format!(
+            "GStreamer: {}",
+            tail.split_whitespace().collect::<Vec<_>>().join(" ")
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn read_gdp(
+    input: impl tokio::io::AsyncRead + Unpin,
+    frames: &broadcast::Sender<Frame>,
+    started: Instant,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, BufReader};
+    let mut input = BufReader::new(input);
+    let mut header = [0; 62];
+    let mut origin = None;
+    // GDP keeps the encoder's frame boundaries and presentation timestamps over stdout.
+    loop {
+        input
+            .read_exact(&mut header)
+            .await
+            .context("Capture ended while reading a frame header")?;
+        ensure!(header[..2] == [1, 0], "Unsupported capture framing");
+        let len = u32::from_be_bytes(header[6..10].try_into()?) as usize;
+        ensure!(len <= MAX_FRAME, "Capture packet is too large");
+        let mut data = vec![0; len];
+        input
+            .read_exact(&mut data)
+            .await
+            .context("Capture ended while reading frame data")?;
+        if header[4..6] == [0, 1] && !data.is_empty() {
+            let nanos = u64::from_be_bytes(header[10..18].try_into()?);
+            ensure!(nanos != u64::MAX, "Capture frame has no timestamp");
+            let (first_pts, call_ticks) = *origin
+                .get_or_insert_with(|| (nanos, started.elapsed().as_micros() as u64 * 9 / 100));
+            let _ = frames.send(Frame {
+                at: Instant::now(),
+                ticks: call_ticks + (nanos.saturating_sub(first_pts) / 1000) * 9 / 100,
+                data: data.into(),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_capture_cannot_announce_sharing() {
+        let video = Video::default();
+        let (stop, _) = watch::channel(false);
+        *video.capture.lock() = Some(stop);
+        assert!(video.announce_share());
+        video.stop();
+        assert!(!video.announce_share());
+        assert!(!*video.sharing.borrow());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn encoder_error_retains_only_the_end_of_stderr() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'discard-me %05000d\\nPipeWire denied\\n' 0 >&2; exit 1",
+        ]);
+        let frames = Video::default().frames;
+        let error = run_encoder(command, &frames, Instant::now())
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("PipeWire denied"));
+        assert!(!error.contains("discard-me"));
+        assert!(error.contains("reading a frame header"));
+    }
 
     #[cfg(unix)]
     #[test]
