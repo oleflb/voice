@@ -207,6 +207,82 @@ async fn native_video_with_late_browser_and_terminal_viewers() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[ignore = "requires the GStreamer plugins and 3 Mb/s loopback shaping in a private namespace"]
+async fn native_video_yields_to_audio_under_congestion() -> Result<()> {
+    let relay = MockRelay::run().await?;
+    let url = relay.url().await.to_string();
+    let room = Room::new("Congestion");
+    let mut jobs = JoinSet::new();
+    let (sender, _sender_active) = start_video_peer::<2>(&mut jobs, &room, &url, "Native");
+    let (bob, _bob_active) = start_video_peer::<3>(&mut jobs, &room, &url, "Bob");
+    let (carol, _carol_active) = start_video_peer::<4>(&mut jobs, &room, &url, "Carol");
+    sender.video.sharing.send_replace(true);
+    for terminal in [&bob, &carol] {
+        let mut rx = subscribe_to_native(terminal).await?;
+        jobs.spawn(async move {
+            while rx.recv().await.is_some() {}
+            Ok(())
+        });
+    }
+    until(
+        || *sender.video.viewers.borrow() == 2,
+        "Both viewers subscribe",
+    )
+    .await?;
+    let source = sender.clone();
+    jobs.spawn(async move {
+        source.state.lock().muted.send_replace(false);
+        let mut clock = tokio::time::interval(Duration::from_millis(20));
+        let packet: Arc<[u8]> = Arc::from([0xf8, 0xff, 0xfe]);
+        loop {
+            clock.tick().await;
+            let now = Instant::now();
+            let ticks = now.duration_since(source.started).as_micros() as u64 * 48 / 1000;
+            source.state.lock().send_audio(now, ticks, packet.clone());
+        }
+    });
+    start_video_encoder(
+        &mut jobs,
+        &sender,
+        "pattern=snow",
+        "video/x-raw,framerate=30/1",
+    );
+    let paused = || {
+        sender.state.lock().notice.as_ref().and_then(|(_, text)| {
+            ["Bob", "Carol"]
+                .into_iter()
+                .find(|name| text.starts_with(&format!("Video paused for {name}:")))
+        })
+    };
+    until(|| paused().is_some(), "Video yields on the congested link").await?;
+    let terminal = if paused() == Some("Bob") {
+        &bob
+    } else {
+        &carol
+    };
+    let audio_tick = || {
+        terminal
+            .state
+            .lock()
+            .peers
+            .values()
+            .find(|p| p.member.name == "Native")
+            .and_then(|p| p.packets.last_key_value().map(|(ticks, _)| *ticks))
+    };
+    let before = audio_tick().unwrap_or(0);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        until(
+            || audio_tick().is_some_and(|now| now > before + 24_000),
+            "Voice arrives while video is paused",
+        ),
+    )
+    .await??;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn live_links_move_to_ethernet_and_back() -> Result<()> {
     use std::{net::IpAddr, sync::atomic::AtomicU8};
     static LINKS: AtomicU8 = AtomicU8::new(1);

@@ -41,4 +41,14 @@ VOICE_TEST_BROWSER_URL=http://127.0.0.1:18761/tests/peer-video-native.html \
   cargo test native_video_with_late_browser_and_terminal_viewers -- --ignored
 ```
 
+To check that native video yields to voice with two viewers, run this in the Nix dev shell on Linux. The traffic limit applies only inside the test's private network namespace:
+
+```sh
+unshare -Urn sh -ec '
+  ip link set lo up
+  tc qdisc add dev lo root tbf rate 3mbit burst 16kb latency 30ms
+  cargo test native_video_yields_to_audio_under_congestion -- --ignored
+'
+```
+
 The terminal client discovers IPv4 and IPv6 routes during the call, including VPN addresses. It prefers interfaces the OS identifies as physical Ethernet and checks a newly connected wire against the current path before upgrading. If a route disappears, peers try another path without leaving the room. Browsers choose their own routes. Set `VOICE_BIND_IP` before starting `voice` to restrict the terminal client to one local address.
