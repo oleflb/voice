@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::PublicKey;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::poll_fn,
     io,
     net::{IpAddr, SocketAddr},
@@ -50,6 +50,58 @@ struct Route {
     socket: Arc<UdpSocket>,
     candidates: Vec<Candidate>,
     binding: stun::Binding,
+    trial: Option<Trial>,
+}
+
+// Before upgrading a healthy link, require three timely, consecutive ICE round trips
+// to the actual peer on the new wire. ICE still authenticates and nominates the final path.
+struct Trial {
+    budget: Duration,
+    checks: BTreeMap<SocketAddr, (Vec<u8>, Instant, u8)>,
+    qualified: bool,
+    next_try: Instant,
+}
+
+impl Trial {
+    fn new(current_rtt: Option<Duration>) -> Self {
+        Self {
+            budget: current_rtt.unwrap_or(Duration::from_millis(100)) + Duration::from_millis(50),
+            checks: BTreeMap::new(),
+            qualified: false,
+            next_try: Instant::now(),
+        }
+    }
+
+    fn sent(&mut self, to: SocketAddr, data: &[u8]) {
+        if data.len() >= 20
+            && data.starts_with(&[0, 1])
+            && data[4..8] == [0x21, 0x12, 0xa4, 0x42]
+            && (self.checks.len() < 32 || self.checks.contains_key(&to))
+        {
+            self.checks.insert(to, (data.to_vec(), Instant::now(), 0));
+        }
+    }
+    async fn reply(&mut self, socket: &UdpSocket, from: SocketAddr, data: &[u8]) {
+        if self.qualified {
+            return;
+        }
+        let Some((request, sent, replies)) = self.checks.get_mut(&from) else {
+            return;
+        };
+        if !data.starts_with(&[1, 1]) || data.get(4..20) != request.get(4..20) {
+            return;
+        }
+        if sent.elapsed() > self.budget {
+            return;
+        }
+        *replies += 1;
+        if *replies == 3 {
+            self.qualified = true;
+            return;
+        }
+        *sent = Instant::now();
+        let _ = socket.send_to(request, from).await;
+    }
 }
 
 impl Route {
@@ -64,10 +116,34 @@ impl Route {
         rtc: &mut Rtc,
         jobs: &mut JoinSet<Result<Option<Candidate>>>,
         call: Arc<Call>,
+        trial: Option<Trial>,
+        order: usize,
     ) -> Result<Self> {
         let socket = Arc::new(interface.bind().await?);
         let local = socket.local_addr()?;
         let host = Candidate::host(local, "udp")?;
+        // str0m otherwise assigns descending preference in discovery order, so
+        // newly plugged Ethernet would always lose to an already active Wi-Fi link.
+        let pref = if interface.wired { 0xfffe } else { 0x9ffe };
+        let priority = (126 << 24)
+            | ((pref - (order % 4096) as u32 * 2 + u32::from(local.is_ipv6())) << 8)
+            | 255;
+        let foundation = host.to_sdp_string().split_whitespace().next().unwrap()
+            ["candidate:".len()..]
+            .to_owned();
+        // A probe can be discovered peer-reflexively before we signal it. Keep its
+        // priority below all real candidates until the path has been verified.
+        let host = Candidate::from_parts(
+            foundation,
+            1,
+            Protocol::Udp,
+            if trial.is_some() { 255 } else { priority },
+            local,
+            host.kind(),
+            None,
+            None,
+            None,
+        );
         let host = rtc
             .add_local_candidate(host)
             .context("Duplicate host candidate")?
@@ -93,9 +169,71 @@ impl Route {
             interface,
             binding,
             candidates: vec![host],
+            trial,
         })
     }
 
+    fn advertise(&self, c: &Candidate) -> Description {
+        // STUN mappings inherit the local preference of the underlying socket.
+        let line = c.to_sdp_string();
+        let mut fields: Vec<_> = line.split_ascii_whitespace().collect();
+        let priority = if self.trial.is_some() {
+            255
+        } else {
+            (c.prio() & 0xff000000) | (self.candidates[0].prio() & 0xffffff)
+        }
+        .to_string();
+        fields[3] = &priority;
+        Description::Ice(fields.join(" "))
+    }
+
+    async fn promote(
+        &mut self,
+        rtc: &mut Rtc,
+        jobs: &mut JoinSet<Result<Option<Candidate>>>,
+        call: Arc<Call>,
+        order: usize,
+    ) -> Result<Vec<Description>> {
+        // Use a fresh socket: remote ICE agents may already cache the low-priority
+        // peer-reflexive probe and ignore a different priority on that same address.
+        let next = Self::open(self.interface.clone(), rtc, jobs, call, None, order).await?;
+        let mut updates = vec![next.advertise(&next.candidates[0])];
+        self.retire(rtc, |s| updates.push(s));
+        *self = next;
+        Ok(updates)
+    }
+}
+
+#[tokio::test]
+async fn ethernet_probe_rejects_slow_or_incomplete_paths() -> Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let remote = UdpSocket::bind("127.0.0.1:0").await?;
+    let to = remote.local_addr()?;
+    let mut trial = Trial::new(Some(Duration::from_millis(10)));
+    let mut request = [0u8; 20];
+    request[1] = 1;
+    request[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+    let mut reply = request;
+    reply[0] = 1;
+    trial.sent(to, &request);
+    trial.checks.get_mut(&to).unwrap().1 -= Duration::from_secs(1);
+    for _ in 0..3 {
+        trial.reply(&socket, to, &reply).await;
+    }
+    assert!(!trial.qualified);
+    trial.sent(to, &request);
+    trial.reply(&socket, to, &reply).await;
+    trial.reply(&socket, to, &reply).await;
+    trial.sent(to, &request); // A lost check resets the sequence.
+    trial.reply(&socket, to, &reply).await;
+    trial.reply(&socket, to, &reply).await;
+    let mut stale = reply;
+    stale[8] ^= 1;
+    trial.reply(&socket, to, &stale).await;
+    assert!(!trial.qualified);
+    trial.reply(&socket, to, &reply).await;
+    assert!(trial.qualified);
+    Ok(())
 }
 
 async fn receive(routes: &[Route], buf: &mut [u8]) -> (usize, io::Result<(SocketAddr, usize)>) {
@@ -328,6 +466,7 @@ impl Link {
         let mut buffer = [0; 65536];
         let mut mute = self.call.state.lock().muted.subscribe();
         let mut sent_mute = None;
+        let mut order = self.routes.len();
         while self.rtc.is_alive() && !commands.is_closed() {
             let deadline = loop {
                 let muted = *mute.borrow_and_update();
@@ -342,6 +481,9 @@ impl Link {
                     Output::Timeout(t) => break t,
                     Output::Transmit(tx) => {
                         if let Some(route) = self.routes.iter_mut().find(|r| r.local == tx.source) {
+                            if let Some(trial) = &mut route.trial {
+                                trial.sent(tx.destination, &tx.contents);
+                            }
                             // One unreachable ICE candidate pair must not abort checks on the others.
                             let _ = route.socket.send_to(&tx.contents, tx.destination).await;
                         }
@@ -356,6 +498,35 @@ impl Link {
             } else {
                 deadline
             };
+            let fallback = self.lost.is_none()
+                && self
+                    .routes
+                    .iter()
+                    .any(|r| Some(r.local.ip()) == self.selected);
+            for r in &mut self.routes {
+                if let Some(t) = &mut r.trial
+                    && (t.qualified || !fallback)
+                    && Instant::now() >= t.next_try
+                {
+                    t.next_try = Instant::now() + Duration::from_secs(3);
+                    match r
+                        .promote(&mut self.rtc, &mut jobs, self.call.clone(), order)
+                        .await
+                    {
+                        Ok(updates) => {
+                            order += 1;
+                            for s in updates {
+                                publish(&mut jobs, s);
+                            }
+                        }
+                        Err(e) => self
+                            .call
+                            .state
+                            .lock()
+                            .log(format!("Cannot upgrade network route: {e}")),
+                    }
+                }
+            }
             let deadline = if let Some(lost) = self.lost {
                 let limit = lost + Duration::from_secs(8);
                 ensure!(Instant::now() < limit, "ICE path lost");
@@ -373,12 +544,15 @@ impl Link {
                         r.retire(&mut self.rtc, |s| publish(&mut jobs, s));
                         false
                     });
+                    let upgrading = self.lost.is_none() && self.channel.is_some() && self.routes.iter().any(|r| Some(r.local.ip()) == self.selected);
                     for interface in interfaces {
                         if self.routes.iter().any(|r| r.interface == interface) { continue; }
-                        match Route::open(interface, &mut self.rtc, &mut jobs, self.call.clone()).await {
+                        let trial = (upgrading && interface.wired).then(|| Trial::new(self.rtt));
+                        match Route::open(interface, &mut self.rtc, &mut jobs, self.call.clone(), trial, order).await {
                             Ok(route) => {
-                                publish(&mut jobs, Description::Ice(route.candidates[0].to_sdp_string()));
+                                publish(&mut jobs, route.advertise(&route.candidates[0]));
                                 self.routes.push(route);
+                                order += 1;
                             }
                             Err(e) => self.call.state.lock().log(format!("Cannot add network route: {e}")),
                         }
@@ -387,14 +561,18 @@ impl Link {
                     if Instant::now() >= retry_candidates && dirty.swap(false, Ordering::Relaxed) {
                         retry_candidates = Instant::now() + Duration::from_secs(8);
                         for r in &self.routes {
-                            for c in &r.candidates { publish(&mut jobs, Description::Ice(c.to_sdp_string())); }
+                            for c in &r.candidates { publish(&mut jobs, r.advertise(c)); }
                         }
                     }
                 }
                 Some(result) = jobs.join_next(), if !jobs.is_empty() => {
                     if let Some(candidate) = result?? && let Some(r) = self.routes.iter_mut().find(|r| r.local == candidate.local()) {
-                        if let Some(added) = self.rtc.add_local_candidate(candidate) {
-                            publish(&mut jobs, Description::Ice(added.to_sdp_string()));
+                        if r.trial.is_some() {
+                            // Help the remote NAT punch the probe without creating a higher-priority local pair.
+                            publish(&mut jobs, r.advertise(&candidate));
+                            r.candidates.push(candidate);
+                        } else if let Some(added) = self.rtc.add_local_candidate(candidate) {
+                            publish(&mut jobs, r.advertise(added));
                             r.candidates.push(added.clone());
                         }
                     }
@@ -413,6 +591,10 @@ impl Link {
                     };
                     let route = &mut self.routes[i];
                     if route.binding.receive(source, &buffer[..n]) { continue; }
+                    if buffer[..n].starts_with(&[1, 1]) && let Some(trial) = &mut route.trial {
+                        trial.reply(&route.socket, source, &buffer[..n]).await;
+                        continue;
+                    }
                     if let Ok(contents) = buffer[..n].try_into() {
                         self.rtc.handle_input(Input::Receive(Instant::now(),Receive{proto:Protocol::Udp, source,destination:self.routes[i].local,contents}))?;
                     }
@@ -480,6 +662,8 @@ pub async fn connect(
             &mut rtc,
             &mut jobs,
             call.clone(),
+            None,
+            routes.len(),
         )
         .await
         {

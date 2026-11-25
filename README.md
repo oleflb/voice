@@ -24,3 +24,5 @@ Run `voice` and enter your display name. Both you and your friends need internet
 3. **Talk or type.** Press `m` to mute or unmute, or `t` to open chat. In chat, `Enter` sends and `Esc` goes back. Outside chat, press `Esc` then `y` to leave the call.
 
 In both clients, **50% participant volume** is the balanced speech level. Go higher to boost a quiet speaker, or set it to zero to silence that person for yourself.
+
+The terminal client discovers IPv4 and IPv6 routes during the call, including VPN addresses. It prefers interfaces the OS identifies as physical Ethernet and checks a newly connected wire against the current path before upgrading. If a route disappears, peers try another path without leaving the room. Browsers choose their own routes. Set `VOICE_BIND_IP` before starting `voice` to restrict the terminal client to one local address.
