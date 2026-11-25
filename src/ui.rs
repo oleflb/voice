@@ -1160,6 +1160,7 @@ mod tests {
         let key = nostr_sdk::Keys::generate().public_key();
         let member = voice_core::Member {
             name: "Bob".into(),
+            video: false,
             session: key,
             identity: key,
         };

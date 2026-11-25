@@ -55,6 +55,8 @@ pub struct Member {
     pub identity: PublicKey,
     pub session: PublicKey,
     pub name: String,
+    #[serde(default)]
+    pub video: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,6 +110,7 @@ pub enum Message {
     Chat { id: u32, text: String },
     Ack { id: u32 },
     Mute { muted: bool },
+    Video { sharing: bool, watching: bool },
 }
 
 #[derive(Serialize)]
@@ -208,6 +211,7 @@ impl Room {
         let content = serde_json::to_string(&(self.session.public_key(), &*name))?;
         let attestation = EventBuilder::new(MEMBERSHIP, content)
             .tag(Tag::identifier(self.room.public_key().to_hex()))
+            .tag(Tag::parse(["video", "1"])?)
             .sign_with_keys(&self.identity)?;
         Ok(nip44::encrypt(
             self.room.secret_key(),
@@ -234,6 +238,10 @@ impl Room {
             identity: proof.pubkey,
             session,
             name,
+            video: proof
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["video", "1"]),
         })
     }
 

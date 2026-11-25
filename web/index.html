@@ -34,6 +34,11 @@
     <small id="discovery" role="status"></small>
     <button id="enable-playback" hidden>Enable speakers</button>
     <div class="bar"><h2 id="title"></h2><div class="actions"><button id="mic" disabled>Mute</button><button id="share">Copy invite</button><button id="leave">Leave</button></div></div>
+    <div class="actions" id="video-controls">
+      <button id="share-screen">Share screen</button><button id="share-camera">Share camera</button>
+      <button id="stop-video" hidden>Stop sharing</button>
+    </div>
+    <video id="preview" aria-label="Your video preview" muted autoplay playsinline hidden></video>
     <div class="columns room">
       <section><h3>Participants</h3><ul id="peers"></ul></section>
       <section><h3>Chat</h3><ol id="chat" role="log" aria-label="Chat history"></ol>

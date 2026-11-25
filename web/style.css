@@ -26,6 +26,8 @@ li { margin-bottom: .65rem; }
 #peers button { border: 0; padding: .15rem .35rem; margin-left: -.35rem; background: transparent; text-align: left; overflow-wrap: anywhere; }
 #peers button:hover:not(:disabled), #peers button:focus-visible { background: #324d3c; }
 #peers button:disabled { opacity: 1; }
+#preview { width: min(100%, 16rem); }
+#peers video { display: block; width: 100%; background: #111; }
 .user-volume { width: min(15rem, 90vw); padding: .85rem 1rem; border: 1px solid #42534b; border-radius: .5rem; background: #1c2922; color: inherit; box-shadow: 0 .4rem 1.4rem #0006; }
 @supports (position-area: bottom) {
   .user-volume { inset: auto; position-area: bottom span-right; position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline; justify-self: start; margin: .2rem 0; }

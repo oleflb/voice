@@ -12,6 +12,7 @@ fn partial_chat_failure_marks_the_original_line_once() {
             identity: key,
             session: key,
             name: name.into(),
+            video: false,
         };
         let mut peer = Peer::new(member, &state.levels);
         if name == "Bob" {

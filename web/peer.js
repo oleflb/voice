@@ -18,7 +18,83 @@ export function startCall(room, lifetime, name, status) {
   const began = performance.now();
   let mic, nextId = 0, heartbeat;
   let context, loading, mixer, player;
+  let video, picking = false;
   const enable = $("enable-playback");
+  const screen = $("share-screen"), camera = $("share-camera"), stop = $("stop-video"), preview = $("preview");
+  const videoOptions = { width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 },
+    frameRate: { ideal: 30, max: 30 } };
+
+  function videoState(p) {
+    const direction = p.video?.currentDirection;
+    if (p.ch?.readyState !== "open" || !direction || direction === "inactive") return;
+    const sharing = !!video && direction.includes("send");
+    const watching = !!p.tile && direction.includes("recv");
+    p.ch.send(JSON.stringify({ type: "video", sharing, watching }));
+  }
+  function sendVideo(p, watching) {
+    const sender = p.video?.sender;
+    const track = watching && p.video?.currentDirection?.includes("send") ? video ?? null : null;
+    // Calls on a sender are serialized by the peer connection, including rapid stop/start.
+    sender?.replaceTrack(track).catch(e => { if (!p.ended && !lifetime.aborted) status(`Video: ${e.message}`); });
+  }
+  function showShareControls() {
+    if (!screen) return;
+    screen.disabled = picking || !!video || !navigator.mediaDevices?.getDisplayMedia;
+    camera.disabled = picking || !!video || !navigator.mediaDevices?.getUserMedia;
+    stop.hidden = !video;
+    preview.hidden = !video;
+    preview.srcObject = video ? new MediaStream([video]) : null;
+  }
+  function stopVideo() {
+    video?.stop();
+    video = null;
+    showShareControls();
+    for (const p of peers.values()) {
+      sendVideo(p, false);
+      if (!lifetime.aborted) videoState(p);
+    }
+  }
+  async function startVideo(display) {
+    if (picking || video) return;
+    picking = true;
+    showShareControls();
+    try {
+      const devices = navigator.mediaDevices;
+      const stream = await (display
+        ? devices.getDisplayMedia({ video: videoOptions, audio: false })
+        : devices.getUserMedia({ video: videoOptions, audio: false }));
+      if (lifetime.aborted) { stream.getTracks().forEach(t => t.stop()); return; }
+      video = stream.getVideoTracks()[0];
+      if (!video) return;
+      video.contentHint = display ? "detail" : "motion";
+      video.onended = () => { if (video?.readyState === "ended") stopVideo(); };
+      for (const p of peers.values()) videoState(p);
+    } catch (e) {
+      if (!lifetime.aborted && e.name !== "NotAllowedError") status(`Video unavailable: ${e.message}`);
+    } finally {
+      picking = false;
+      if (!lifetime.aborted) showShareControls();
+    }
+  }
+  if (screen) {
+    showShareControls();
+    screen.onclick = () => startVideo(true);
+    camera.onclick = () => startVideo(false);
+    stop.onclick = stopVideo;
+  }
+
+  function watchVideo(p, watch) {
+    p.tile?.remove();
+    p.tile = null;
+    p.watch.textContent = watch ? "Stop watching" : "Watch video";
+    if (watch) {
+      const tile = p.tile = append(p.row, "video", "");
+      tile.muted = tile.autoplay = tile.playsInline = tile.controls = true;
+      tile.setAttribute("aria-label", `Video from ${p.name}`);
+      if (p.videoTrack) tile.srcObject = new MediaStream([p.videoTrack]);
+    }
+    videoState(p);
+  }
   function audioContext() {
     return context ??= new AudioContext({ sampleRate: 48000 });
   }
@@ -121,6 +197,9 @@ export function startCall(room, lifetime, name, status) {
     p.lost = null;
     p.retryAt = performance.now() + 1000 * 2 ** Math.min(p.failures++, 5);
     p.pc?.close();
+    p.watch?.remove();
+    p.tile?.remove();
+    p.watch = p.tile = p.video = p.videoTrack = null;
     watchTrack(p.meter, null);
     p.muted = false;
     p.button.disabled = true;
@@ -139,6 +218,7 @@ export function startCall(room, lifetime, name, status) {
       p.failures = 0;
       connection(p);
       ch.send(JSON.stringify({ type: "mute", muted: !mic }));
+      videoState(p);
     };
     ch.onclose = () => { if (current()) finish(p, "disconnected"); };
     ch.onmessage = ({ data }) => {
@@ -148,6 +228,19 @@ export function startCall(room, lifetime, name, status) {
       try { msg = JSON.parse(data); } catch { return; }
       if (msg?.type === "mute" && typeof msg.muted === "boolean") {
         p.muted = msg.muted;
+        return;
+      }
+      if (msg?.type === "video" && typeof msg.sharing === "boolean" && typeof msg.watching === "boolean" && p.video) {
+        sendVideo(p, msg.watching);
+        if (!msg.sharing && p.watch) {
+          if (p.tile) watchVideo(p, false);
+          p.watch.remove();
+          p.watch = null;
+        } else if (msg.sharing && !p.watch && p.video.currentDirection?.includes("recv")) {
+          p.watch = append(p.row, "button", "Watch video");
+          p.watch.setAttribute("aria-label", `Toggle video from ${p.name}`);
+          p.watch.onclick = () => watchVideo(p, !p.tile);
+        }
         return;
       }
       if (!Number.isInteger(msg?.id) || msg.id < 1 || msg.id > 0xffffffff) return;
@@ -209,6 +302,12 @@ export function startCall(room, lifetime, name, status) {
       connection(p);
     };
     pc.ontrack = async ({ track }) => {
+      if (track.kind === "video") {
+        if (!current()) return;
+        p.videoTrack = track;
+        if (p.tile) p.tile.srcObject = new MediaStream([track]);
+        return;
+      }
       try {
         await (loading ??= loadMixer());
         if (!current()) return;
@@ -277,8 +376,11 @@ export function startCall(room, lifetime, name, status) {
       if (!current()) return;
       p.audio = pc.getTransceivers().find(t => t.receiver.track.kind === "audio");
       p.audio.direction = "sendrecv";
+      p.video = pc.getTransceivers().find(t => t.receiver.track.kind === "video");
+      if (p.video) p.video.direction = "sendrecv";
     } else {
       p.audio = pc.addTransceiver("audio", { direction: "sendrecv" });
+      if (p.member.video) p.video = pc.addTransceiver("video", { direction: "sendrecv" });
       channel(p, pc.createDataChannel("voice"), current);
     }
     await p.audio.sender.replaceTrack(mic ?? null);
@@ -365,6 +467,8 @@ export function startCall(room, lifetime, name, status) {
     if (!lifetime.aborted) heartbeat = setTimeout(announce, 8000);
   }
   lifetime.addEventListener("abort", () => {
+    stopVideo();
+    if (screen) screen.onclick = camera.onclick = stop.onclick = null;
     ++generation;
     clearInterval(activity);
     watchTrack(self, null);
