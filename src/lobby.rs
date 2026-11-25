@@ -291,6 +291,7 @@ async fn room_session(
                 names.retain(|_, (_, at): &mut (String, Instant)| at.elapsed() < Duration::from_secs(35));
                 roster.send_replace(available.then(|| names.values().map(|(name, _)| name.clone()).collect()));
                 if let Some(c) = &call {
+                    c.state.lock().peers.retain(|_, p| p.control.is_some() || p.seen.elapsed() < Duration::from_secs(35));
                     if let Ok(current) = bind_ips() {
                         network.send_modify(|published| {
                             // Retire vanished paths immediately; debounce additions while a fallback exists.
@@ -300,7 +301,6 @@ async fn room_session(
                         });
                         previous = current;
                     }
-                    c.state.lock().peers.retain(|_, p| p.status == Status::Connected || p.seen.elapsed() < Duration::from_secs(35));
                 }
             }
             update = room.next() => {

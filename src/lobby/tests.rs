@@ -139,12 +139,19 @@ async fn live_links_move_to_ethernet_and_back() -> Result<()> {
     LINKS.store(0, Ordering::SeqCst);
     until(
         || {
-            alice
-                .state
-                .lock()
-                .peers
-                .values()
-                .all(|p| p.control.is_none())
+            let s = alice.state.lock();
+            s.peers.len() == 2
+                && s.peers.values().all(|p| {
+                    p.status == Status::Reconnecting && p.control.is_some() && p.attempt == 0
+                })
+        },
+        "both existing links should show a warning during the no-route grace period",
+    )
+    .await?;
+    until(
+        || {
+            let s = alice.state.lock();
+            s.peers.len() == 2 && s.peers.values().all(|p| p.control.is_none())
         },
         "links should time out with no usable routes",
     )

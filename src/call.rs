@@ -18,6 +18,7 @@ use voice_core::Member;
 pub enum Status {
     Present,
     Connecting,
+    Reconnecting,
     Connected,
     Disconnected,
     Failed,

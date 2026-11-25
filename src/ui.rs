@@ -536,11 +536,12 @@ impl View {
                 .map(|(&id, p)| PeerRow {
                     id,
                     name: p.member.name.clone(),
-                    connection: match (p.status, p.seen.elapsed()) {
-                        (Status::Connected, age) if age < Duration::from_secs(20) => ' ',
-                        (Status::Failed | Status::Disconnected, _) => '!',
-                        (_, age) => ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-                            [(age.as_millis() / 150 % 10) as usize],
+                    connection: match p.status {
+                        Status::Connected => ' ',
+                        Status::Reconnecting => '↻',
+                        Status::Failed | Status::Disconnected => '!',
+                        _ => ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+                            [(call.started.elapsed().as_millis() / 150 % 10) as usize],
                     },
                     muted: p.muted,
                     local_mute: p.local_mute,
@@ -1154,6 +1155,28 @@ mod tests {
         ]));
         call.state.lock().log("wrapped message ".repeat(40));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20))?;
+        // Even stale relay presence must not put a warning on a healthy direct call.
+        let key = nostr_sdk::Keys::generate().public_key();
+        let member = voice_core::Member {
+            name: "Bob".into(),
+            session: key,
+            identity: key,
+        };
+        let mut peer = crate::call::Peer::new(member, &first.config.levels);
+        peer.seen = Instant::now() - Duration::from_secs(40);
+        call.state.lock().peers.insert(key, peer);
+        for (status, label) in [
+            (Status::Reconnecting, "Bob↻50%"),
+            (Status::Connected, "Bob50%"),
+        ] {
+            call.state.lock().peers.get_mut(&key).unwrap().status = status;
+            let frame = terminal.draw(|f| view.draw(f, &first))?;
+            let text: String = frame.buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(
+                text.split_whitespace().collect::<String>().contains(label),
+                "{text}"
+            );
+        }
         view.chat_scroll = u16::MAX;
         terminal.draw(|f| view.draw(f, &first))?;
         let top = view.chat_scroll;

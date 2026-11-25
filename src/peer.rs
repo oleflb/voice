@@ -267,6 +267,26 @@ struct Link {
 }
 
 impl Link {
+    fn transport_state(&mut self, available: bool) {
+        if available {
+            self.lost = None;
+        } else {
+            self.lost.get_or_insert_with(Instant::now);
+        }
+        if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
+            && p.attempt == self.attempt
+        {
+            p.status = if !available {
+                Status::Reconnecting
+            } else if self.channel.is_some() {
+                p.failures = 0;
+                Status::Connected
+            } else {
+                Status::Connecting
+            };
+        }
+    }
+
     fn try_send(&mut self, msg: Message) -> Result<bool> {
         let mut channel = self
             .channel
@@ -377,18 +397,18 @@ impl Link {
             }
             Event::ChannelOpen(id, name) if name == "voice" && self.channel.is_none() => {
                 self.channel = Some(id);
-                if let Some(p) = self.call.state.lock().peers.get_mut(&self.session)
-                    && p.attempt == self.attempt
-                {
-                    p.status = Status::Connected;
-                    p.failures = 0;
-                }
+                self.transport_state(self.lost.is_none() && !self.routes.is_empty());
             }
             Event::ChannelClose(id) if self.channel == Some(id) => self.rtc.disconnect(),
             Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected) => {
-                self.lost.get_or_insert(Instant::now());
+                self.transport_state(false);
             }
-            Event::IceConnectionStateChange(s) if s.is_connected() => self.lost = None,
+            Event::IceConnectionStateChange(s) if s.is_connected() => {
+                self.transport_state(!self.routes.is_empty());
+            }
+            Event::IceConnectionStateChange(_) if self.channel.is_some() => {
+                self.transport_state(false);
+            }
             Event::ChannelData(d)
                 if self.channel == Some(d.id) && !d.binary && d.data.len() <= 16384 =>
             {
@@ -546,6 +566,7 @@ impl Link {
                         r.retire(&mut self.rtc, |s| publish(&mut jobs, s));
                         false
                     });
+                    if self.routes.is_empty() { self.transport_state(false); }
                     let upgrading = self.lost.is_none() && self.channel.is_some() && self.routes.iter().any(|r| Some(r.local.ip()) == self.selected);
                     for interface in interfaces {
                         if self.routes.iter().any(|r| r.interface == interface) { continue; }
@@ -559,7 +580,6 @@ impl Link {
                             Err(e) => self.call.state.lock().notify(format!("Cannot add network route: {e}")),
                         }
                     }
-                    if self.routes.is_empty() { self.lost.get_or_insert(Instant::now()); }
                     if Instant::now() >= retry_candidates && dirty.swap(false, Ordering::Relaxed) {
                         retry_candidates = Instant::now() + Duration::from_secs(8);
                         for r in &self.routes {
@@ -587,7 +607,7 @@ impl Link {
                             let route = self.routes.remove(i);
                             route.retire(&mut self.rtc, |s| publish(&mut jobs, s));
                             self.call.state.lock().notify(format!("Local route {}: {e}", route.local));
-                            if self.routes.is_empty() { self.lost.get_or_insert(Instant::now()); }
+                            if self.routes.is_empty() { self.transport_state(false); }
                             continue;
                         }
                     };
