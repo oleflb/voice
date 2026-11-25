@@ -74,13 +74,130 @@ fn ivf(width: u16, height: u16) -> [u8; 32] {
     header
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalVideo {
+    Blocks,
+    Kitty,
+    KittyShm,
+}
+
+pub fn probe_kitty_graphics() -> TerminalVideo {
+    #[cfg(unix)]
+    {
+        use ratatui_image::picker::cap_parser::Parser;
+        use std::io::{self, IsTerminal, Write};
+        let stdin = io::stdin();
+        let mut stdout = io::stdout().lock();
+        if stdin.is_terminal() && stdout.is_terminal() {
+            let tmux = std::env::var_os("TMUX").is_some();
+            let query = Parser::query(tmux, Default::default());
+            if stdout
+                .write_all(query.as_bytes())
+                .and_then(|()| stdout.flush())
+                .is_ok()
+                && read_kitty_reply(&stdin, Duration::from_millis(300)).unwrap_or(false)
+            {
+                return if probe_kitty_shm(&stdin, &mut stdout, tmux).unwrap_or(false) {
+                    TerminalVideo::KittyShm
+                } else {
+                    TerminalVideo::Kitty
+                };
+            }
+        }
+    }
+    TerminalVideo::Blocks
+}
+
+#[cfg(unix)]
+fn probe_kitty_shm(
+    input: impl std::os::fd::AsFd,
+    output: &mut impl std::io::Write,
+    tmux: bool,
+) -> Result<bool> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use ratatui_image::picker::cap_parser::Parser;
+    use rustix::{fs::Mode, shm};
+    use std::io::Write;
+
+    let name = format!("/voice-probe-{}", std::process::id());
+    let flags = shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR;
+    let fd = shm::open(name.as_str(), flags, Mode::RUSR | Mode::WUSR)?;
+    let result = (|| {
+        std::fs::File::from(fd).write_all(&[0; 3])?;
+        let (start, esc, end) = Parser::tmux_start_escape_end(tmux);
+        let payload = STANDARD.encode(&name);
+        write!(
+            output,
+            "{start}{esc}_Gi=31,s=1,v=1,a=q,t=s,f=24;{payload}{esc}\\{esc}[5n{end}"
+        )?;
+        output.flush()?;
+        Ok(read_kitty_reply(input, Duration::from_millis(300))?)
+    })();
+    let _ = shm::unlink(name.as_str());
+    result
+}
+
+#[cfg(unix)]
+fn read_kitty_reply(input: impl std::os::fd::AsFd, timeout: Duration) -> rustix::io::Result<bool> {
+    use ratatui_image::picker::cap_parser::{Parser, Response};
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    let mut fds = [PollFd::new(&input, PollFlags::IN)];
+    let mut parser = Parser::new();
+    let started = Instant::now();
+    let mut kitty = false;
+    // Keep stdin on this thread: a detached blocking read could steal the next keypress.
+    while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+        if poll(
+            &mut fds,
+            Some(&remaining.try_into().expect("short probe timeout")),
+        )? == 0
+        {
+            break;
+        }
+        let mut bytes = [0; 128];
+        let read = rustix::io::read(&input, &mut bytes[..])?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &bytes[..read] {
+            for response in parser.push(char::from(byte)) {
+                match response {
+                    Response::Kitty => kitty = true,
+                    Response::Status => return Ok(kitty),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(kitty)
+}
+
 pub async fn play(
     frames: mpsc::Receiver<Frame>,
     mut stop: watch::Receiver<bool>,
+    mode: TerminalVideo,
     request_keyframe: impl Fn(),
 ) -> Result<()> {
     let mut command = Command::new("mpv");
-    command.arg("--vo=tct");
+    if mode == TerminalVideo::Blocks {
+        command.arg("--vo=tct");
+    } else {
+        command.args(["--vo=kitty,tct", "--vo-kitty-alt-screen=no"]);
+        if mode == TerminalVideo::KittyShm {
+            command.arg("--vo-kitty-use-shm=yes");
+        } else {
+            // shortcut: cap base64 transfer at 320×180, revisit with compressed graphics.
+            command.args([
+                "--vo-kitty-use-shm=no",
+                "--vo-kitty-width=320",
+                "--vo-kitty-height=180",
+            ]);
+        }
+        if std::env::var_os("TMUX").is_some() {
+            command.arg("--vo-kitty-auto-multiplexer-passthrough=yes");
+        }
+    }
     let mut child = command
         .args([
             "--no-config",
@@ -160,6 +277,42 @@ async fn write_ivf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_requires_a_successful_graphics_reply() {
+        use std::{io::Write, os::unix::net::UnixStream};
+        for (reply, supported) in [
+            (&b"\x1b_Gi=31;OK\x1b\\\x1b[0n"[..], true),
+            (&b"\x1b_Gi=31;EINVAL\x1b\\\x1b[0n"[..], false),
+            (&b"\x1b[0n"[..], false),
+        ] {
+            let (input, mut terminal) = UnixStream::pair().unwrap();
+            terminal.write_all(reply).unwrap();
+            assert_eq!(
+                read_kitty_reply(input, Duration::from_millis(100)).unwrap(),
+                supported
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_terminal_does_not_keep_reading_input() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixStream,
+        };
+        let (mut input, mut terminal) = UnixStream::pair().unwrap();
+        assert!(!read_kitty_reply(&input, Duration::from_millis(5)).unwrap());
+        terminal.write_all(b"v").unwrap();
+        input
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut key = [0];
+        input.read_exact(&mut key).unwrap();
+        assert_eq!(&key, b"v");
+    }
 
     #[tokio::test]
     async fn stalled_player_finishes_its_frame_and_skips_stale_deltas() -> Result<()> {

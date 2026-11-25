@@ -972,6 +972,7 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
     let quitting = shutdown.subscribe();
     let had_terminal = std::io::stdout().is_terminal();
     let mut terminal = ratatui::try_init()?;
+    let terminal_video = crate::video::probe_kitty_graphics();
     let mut view = View::default();
     let mut viewer: Option<(
         tokio::task::JoinHandle<()>,
@@ -1105,15 +1106,16 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
                             mouse_enabled = false;
                             viewer = Some((
                                 tokio::spawn(async move {
-                                    let result = crate::video::play(frames, quit, || {
-                                        if let Some(tx) =
-                                            control.as_ref().and_then(|tx| tx.upgrade())
-                                        {
-                                            let _ =
-                                                tx.try_send(crate::peer::Command::VideoKeyframe);
-                                        }
-                                    })
-                                    .await;
+                                    let result =
+                                        crate::video::play(frames, quit, terminal_video, || {
+                                            if let Some(tx) =
+                                                control.as_ref().and_then(|tx| tx.upgrade())
+                                            {
+                                                let _ = tx
+                                                    .try_send(crate::peer::Command::VideoKeyframe);
+                                            }
+                                        })
+                                        .await;
                                     let mut state = call.state.lock();
                                     if let Some(peer) = state.peers.get_mut(&id) {
                                         peer.viewer.send_replace(None);
