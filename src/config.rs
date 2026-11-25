@@ -36,7 +36,7 @@ impl Room {
         })
     }
 }
-pub const DEFAULT_PEER_VOLUME: f32 = 0.5;
+pub use voice_playback::DEFAULT_PEER_VOLUME;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Levels {

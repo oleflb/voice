@@ -3197,8 +3197,6 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "sonora",
- "sonora-agc2",
- "sonora-simd",
  "str0m",
  "stun-types",
  "tempfile",
@@ -3206,6 +3204,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "voice-core",
+ "voice-playback",
 ]
 
 [[package]]
