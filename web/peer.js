@@ -15,6 +15,7 @@ function valid(text) {
 export function startCall(room, lifetime, name, status) {
   const stun = new URL(location.href).searchParams.get("stun") ?? "stun.cloudflare.com:3478";
   const peers = new Map();
+  const began = performance.now();
   let mic, nextId = 0, heartbeat;
   let context, loading, mixer, player;
   const enable = $("enable-playback");
@@ -116,6 +117,8 @@ export function startCall(room, lifetime, name, status) {
     p.ended = reason;
     connection(p);
     clearTimeout(p.timer);
+    clearTimeout(p.lost);
+    p.retryAt = performance.now() + 1000 * 2 ** Math.min(p.failures++, 5);
     p.pc?.close();
     watchTrack(p.meter, null);
     p.muted = false;
@@ -130,15 +133,18 @@ export function startCall(room, lifetime, name, status) {
     p.volume?.remove();
   }
   function channel(p, ch) {
-    if (ch.label !== "voice" || p.ch) { ch.close(); return; }
+    if (ch.label !== "voice" || p.ch || p.ended) { ch.close(); return; }
     p.ch = ch;
     ch.onopen = () => {
+      if (p.ended) return;
       clearTimeout(p.timer);
+      p.failures = 0;
       connection(p);
       ch.send(JSON.stringify({ type: "mute", muted: !mic }));
     };
     ch.onclose = () => finish(p, "disconnected");
     ch.onmessage = ({ data }) => {
+      if (p.ended || lifetime.aborted) return;
       if (typeof data !== "string" || data.length > 16384) return;
       let msg;
       try { msg = JSON.parse(data); } catch { return; }
@@ -158,7 +164,7 @@ export function startCall(room, lifetime, name, status) {
   }
 
   async function signal(p, update) {
-    const send = description => room.send(JSON.stringify(p.member), JSON.stringify(description));
+    const send = description => sendSignal(p, description);
     async function add(candidate) {
       try { await p.pc.addIceCandidate({ candidate, sdpMLineIndex: 0 }); }
       catch { /* An unusable route does not invalidate the other candidates. */ }
@@ -182,10 +188,14 @@ export function startCall(room, lifetime, name, status) {
     if (p.pc || (!update.Presence?.dial && !offer)) return;
     const pc = p.pc = new RTCPeerConnection({ bundlePolicy: "max-bundle", iceServers: stun ? [{ urls: `stun:${stun}` }] : [] });
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate?.candidate && !lifetime.aborted) send({ Ice: candidate.candidate }).catch(e => status(e.message));
+      if (candidate?.candidate && !p.ended && !lifetime.aborted) send({ Ice: candidate.candidate }).catch(e => status(e.message));
     };
     p.timer = setTimeout(() => finish(p, "connection failed"), 30000);
-    pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") finish(p, "connection failed"); };
+    pc.onconnectionstatechange = () => {
+      clearTimeout(p.lost);
+      if (pc.connectionState === "failed") finish(p, "connection failed");
+      if (pc.connectionState === "disconnected") p.lost = setTimeout(() => finish(p, "disconnected"), 8000);
+    };
     pc.ontrack = async ({ track }) => {
       try {
         await (loading ??= loadMixer());
@@ -258,9 +268,12 @@ export function startCall(room, lifetime, name, status) {
     await p.audio.sender.replaceTrack(mic ?? null);
     await pc.setLocalDescription(offer ? await pc.createAnswer() : await pc.createOffer());
     const description = { [offer ? "Answer" : "Offer"]: JSON.stringify(pc.localDescription) };
-    if (!lifetime.aborted) await send(description);
+    if (!lifetime.aborted && !p.ended) await send(description);
   }
 
+  function sendSignal(p, signal) {
+    return room.send(JSON.stringify(p.member), JSON.stringify(p.attempt ? { attempt: p.attempt, signal } : signal));
+  }
   function receive(member, update) {
     if (update === "Query") { room.announce().catch(e => status(e.message)); return; }
     let p = peers.get(member.session);
@@ -268,6 +281,34 @@ export function startCall(room, lifetime, name, status) {
       if (p) { finish(p, "left"); p.row.remove(); peers.delete(member.session); }
       return;
     }
+    let attempt = update.Signal?.attempt ?? 0;
+    if (attempt) update = { Signal: update.Signal.signal };
+    let failures = p?.failures ?? 0;
+    let candidates = new Set();
+    const retry = p && performance.now() >= (p.retryAt ?? 0);
+    if (p && update.Signal && attempt < p.attempt) return;
+    if (p && attempt > p.attempt && update.Signal?.Ice) {
+      if (p.nextIce?.attempt !== attempt) p.nextIce = { attempt, candidates: new Set() };
+      if (p.nextIce.candidates.size < 32) p.nextIce.candidates.add(update.Signal.Ice);
+      return;
+    }
+    if (p?.ended && update.Presence && !update.Presence.dial && retry) {
+      p.retryAt = performance.now() + 8000;
+      sendSignal(p, "Reconnect").catch(e => status(e.message));
+    }
+    if (p && ((update.Signal === "Reconnect" && attempt === p.attempt && retry)
+        || (p.ended && update.Presence?.dial && retry))) {
+      attempt = Math.max(p.attempt + 1, Math.floor((performance.now() - began) / 1000));
+      update = { Presence: { dial: true } };
+    }
+    if (p && attempt > p.attempt && (update.Signal?.Offer || update.Presence?.dial)) {
+      if (p.nextIce?.attempt === attempt) candidates = p.nextIce.candidates;
+      finish(p, "reconnecting");
+      p.row.remove();
+      peers.delete(member.session);
+      p = null;
+    }
+    if (p && update.Signal && attempt !== p.attempt) return;
     if (!p) {
       if (peers.size >= 5) return;
       const row = append($("peers"), "li", "");
@@ -276,7 +317,7 @@ export function startCall(room, lifetime, name, status) {
       button.disabled = true;
       button.title = `Adjust volume for ${name}`;
       append(button, "span", name).className = "participant-name";
-      p = { member, name, row, button, seen: performance.now(), meter: meter(button), label: append(button, "span", ""), pending: new Map(), candidates: new Set(), work: Promise.resolve() };
+      p = { member, name, row, button, attempt, failures, seen: performance.now(), meter: meter(button), label: append(button, "span", ""), pending: new Map(), candidates, work: Promise.resolve() };
       p.label.className = "connection";
       p.label.setAttribute("role", "img");
       connection(p);
