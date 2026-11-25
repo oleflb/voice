@@ -7,7 +7,7 @@ use stun_types::{
 };
 use tokio::{
     net::{UdpSocket, lookup_host},
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::timeout,
 };
 
@@ -17,7 +17,7 @@ pub struct Binding {
 }
 
 impl Binding {
-    pub fn new() -> (
+    fn new() -> (
         Self,
         MessageWriteVec,
         mpsc::Receiver<(SocketAddr, SocketAddr)>,
@@ -57,7 +57,34 @@ impl Binding {
     }
 }
 
-pub async fn gather(
+pub async fn discover(
+    socket: &UdpSocket,
+    server: &str,
+    active: watch::Sender<Option<Binding>>,
+    mut failed: impl FnMut(anyhow::Error),
+) -> Option<Candidate> {
+    tokio::select! {
+        biased;
+        _ = active.closed() => None,
+        candidate = async {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                let (binding, request, replies) = Binding::new();
+                active.send(Some(binding)).ok()?;
+                let result = gather(socket, server, request, replies).await;
+                active.send(None).ok()?;
+                match result {
+                    Ok(candidate) => return Some(candidate),
+                    Err(e) => failed(e),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(60));
+            }
+        } => candidate,
+    }
+}
+
+async fn gather(
     socket: &UdpSocket,
     server: &str,
     request: MessageWriteVec,
@@ -83,6 +110,29 @@ pub async fn gather(
         }
     }
     bail!("STUN server did not respond")
+}
+
+#[tokio::test]
+async fn discovery_retries_until_route_is_dropped() -> Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let (active, route) = watch::channel(None);
+    let (failed, mut failures) = mpsc::unbounded_channel();
+    let job = tokio::spawn(async move {
+        discover(&socket, "[::1]:3478", active, |_| {
+            failed.send(tokio::time::Instant::now()).unwrap();
+        })
+        .await
+    });
+    let first = timeout(Duration::from_secs(5), failures.recv())
+        .await?
+        .unwrap();
+    let second = timeout(Duration::from_secs(5), failures.recv())
+        .await?
+        .unwrap();
+    assert!(second - first >= Duration::from_secs(1));
+    drop(route);
+    assert!(timeout(Duration::from_millis(500), job).await??.is_none());
+    Ok(())
 }
 
 #[tokio::test]

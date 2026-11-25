@@ -44,12 +44,14 @@ pub fn valid(text: &str) -> bool {
     !text.trim().is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
 }
 
+type Jobs = JoinSet<Result<Option<(Arc<UdpSocket>, Candidate)>>>;
+
 struct Route {
     interface: Interface,
     local: SocketAddr,
     socket: Arc<UdpSocket>,
     candidates: Vec<Candidate>,
-    binding: stun::Binding,
+    binding: watch::Receiver<Option<stun::Binding>>,
     trial: Option<Trial>,
 }
 
@@ -114,7 +116,7 @@ impl Route {
     async fn open(
         interface: Interface,
         rtc: &mut Rtc,
-        jobs: &mut JoinSet<Result<Option<Candidate>>>,
+        jobs: &mut Jobs,
         call: Arc<Call>,
         trial: Option<Trial>,
         order: usize,
@@ -148,19 +150,17 @@ impl Route {
             .add_local_candidate(host)
             .context("Duplicate host candidate")?
             .clone();
-        let (binding, request, rx) = stun::Binding::new();
+        let (active, binding) = watch::channel(None);
         let server =
             std::env::var("VOICE_STUN").unwrap_or_else(|_| "stun.cloudflare.com:3478".into());
         if !server.is_empty() && !local.ip().is_loopback() {
             let socket = socket.clone();
             jobs.spawn(async move {
-                match stun::gather(&socket, &server, request, rx).await {
-                    Ok(candidate) => Ok(Some(candidate)),
-                    Err(e) => {
-                        call.state.lock().log(format!("STUN on {local}: {e}"));
-                        Ok(None)
-                    }
-                }
+                let candidate = stun::discover(&socket, &server, active, |e| {
+                    call.state.lock().notify(format!("STUN on {local}: {e}"));
+                })
+                .await;
+                Ok(candidate.map(|c| (socket, c)))
             });
         }
         Ok(Self {
@@ -190,7 +190,7 @@ impl Route {
     async fn promote(
         &mut self,
         rtc: &mut Rtc,
-        jobs: &mut JoinSet<Result<Option<Candidate>>>,
+        jobs: &mut Jobs,
         call: Arc<Call>,
         order: usize,
     ) -> Result<Vec<Description>> {
@@ -457,7 +457,7 @@ impl Link {
         member: Member,
         description: Description,
         mut network: watch::Receiver<Vec<Interface>>,
-        mut jobs: JoinSet<Result<Option<Candidate>>>,
+        mut jobs: Jobs,
     ) -> Result<()> {
         let attempt = self.attempt;
         let publisher = room.clone();
@@ -470,7 +470,7 @@ impl Link {
         });
         let dirty = Arc::new(AtomicBool::new(false));
         let mut retry_candidates = Instant::now();
-        let publish = |jobs: &mut JoinSet<Result<Option<Candidate>>>, description| {
+        let publish = |jobs: &mut Jobs, description| {
             let (room, member) = (room.clone(), member.clone());
             let dirty = dirty.clone();
             jobs.spawn(async move {
@@ -588,7 +588,7 @@ impl Link {
                     }
                 }
                 Some(result) = jobs.join_next(), if !jobs.is_empty() => {
-                    if let Some(candidate) = result?? && let Some(r) = self.routes.iter_mut().find(|r| r.local == candidate.local()) {
+                    if let Some((socket, candidate)) = result?? && let Some(r) = self.routes.iter_mut().find(|r| Arc::ptr_eq(&r.socket, &socket)) {
                         if r.trial.is_some() {
                             // Help the remote NAT punch the probe without creating a higher-priority local pair.
                             publish(&mut jobs, r.advertise(&candidate));
@@ -612,7 +612,7 @@ impl Link {
                         }
                     };
                     let route = &mut self.routes[i];
-                    if route.binding.receive(source, &buffer[..n]) { continue; }
+                    if route.binding.borrow().as_ref().is_some_and(|b| b.receive(source, &buffer[..n])) { continue; }
                     if buffer[..n].starts_with(&[1, 1]) && let Some(trial) = &mut route.trial {
                         trial.reply(&route.socket, source, &buffer[..n]).await;
                         continue;
