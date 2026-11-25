@@ -201,6 +201,44 @@ async fn live_links_move_to_ethernet_and_back() -> Result<()> {
         "only Alice's two links should redial when Ethernet returns",
     )
     .await?;
+
+    relay.shutdown();
+    until(
+        || {
+            [&alice, &bob, &carol]
+                .iter()
+                .all(|c| c.state.lock().discovery_unavailable)
+        },
+        "all participants should report discovery unavailable with the relay offline",
+    )
+    .await?;
+    // Exercise stale relay presence without another 35 seconds of wall-clock time.
+    let stale = Instant::now() - Duration::from_secs(40);
+    for call in [&alice, &bob, &carol] {
+        let mut s = call.state.lock();
+        for p in s.peers.values_mut() {
+            p.seen = stale;
+        }
+        assert!(s.send_chat(&call.name, "relay offline"));
+    }
+    until(
+        || {
+            [&alice, &bob, &carol].iter().all(|call| {
+                let s = call.state.lock();
+                s.discovery_unavailable
+                    && s.peers.len() == 2
+                    && s.peers.values().all(|p| {
+                        p.status == Status::Connected
+                            && p.seen == stale
+                            && s.chat.iter().any(|line| {
+                                line.as_ref() == format!("{}: relay offline", p.member.name)
+                            })
+                    })
+            })
+        },
+        "direct chat should reach both peers and all links should still look connected",
+    )
+    .await?;
     Ok(())
 }
 
