@@ -8,6 +8,11 @@ function append(parent, tag, text) {
   parent.append(el);
   return el;
 }
+function chatLine(text) {
+  const chat = $("chat");
+  if (chat.childElementCount >= 100) chat.firstElementChild.remove();
+  return append(chat, "li", text);
+}
 function valid(text) {
   return typeof text === "string" && text.trim() && !/[\u0000-\u001f\u007f-\u009f]/u.test(text)
     && new TextEncoder().encode(text).length <= 4096;
@@ -112,13 +117,21 @@ export function startCall(room, lifetime, name, status) {
       }
     }
   }
-  enable.onclick = play;
+  enable.onclick = () => mixer ? play() : startPlayback();
+  function startPlayback() {
+    return loading ??= loadMixer().catch(e => {
+      loading = null;
+      if (!lifetime.aborted) {
+        enable.hidden = false;
+        status(`Speakers unavailable: ${e.message}`);
+      }
+    });
+  }
   async function loadMixer() {
     const ctx = audioContext();
-    const [module] = await Promise.all([
-      WebAssembly.compileStreaming(fetch(new URL("./playback.wasm", import.meta.url))),
-      ctx.audioWorklet.addModule(new URL("./playback.js", import.meta.url)),
-    ]);
+    const module = await WebAssembly.compileStreaming(fetch(new URL("./playback.wasm", import.meta.url)));
+    if (lifetime.aborted) return;
+    await ctx.audioWorklet.addModule(new URL("./playback.js", import.meta.url));
     if (lifetime.aborted) return;
     mixer = new AudioWorkletNode(ctx, "voice-playback", {
       numberOfInputs: 5, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit",
@@ -129,6 +142,10 @@ export function startCall(room, lifetime, name, status) {
     mixer.connect(sink);
     player = append($("call"), "audio", "");
     player.srcObject = sink.stream;
+    for (const p of peers.values()) {
+      p.attachAudio?.();
+      p.attachAudio = null;
+    }
     play();
   }
   function meter(parent) {
@@ -200,6 +217,7 @@ export function startCall(room, lifetime, name, status) {
     p.watch?.remove();
     p.tile?.remove();
     p.watch = p.tile = p.video = p.videoTrack = null;
+    p.attachAudio = null;
     watchTrack(p.meter, null);
     p.muted = false;
     p.button.disabled = true;
@@ -245,7 +263,7 @@ export function startCall(room, lifetime, name, status) {
       }
       if (!Number.isInteger(msg?.id) || msg.id < 1 || msg.id > 0xffffffff) return;
       if (msg.type === "chat" && valid(msg.text)) {
-        append($("chat"), "li", `${p.name}: ${msg.text}`);
+        chatLine(`${p.name}: ${msg.text}`);
         // Older clients expect a receipt. A lost receipt doesn't affect the call.
         try { ch.send(JSON.stringify({ type: "ack", id: msg.id })); } catch {}
       }
@@ -301,18 +319,22 @@ export function startCall(room, lifetime, name, status) {
       }
       connection(p);
     };
-    pc.ontrack = async ({ track }) => {
+    pc.ontrack = ({ track }) => {
+      if (!current()) return;
       if (track.kind === "video") {
-        if (!current()) return;
         p.videoTrack = track;
         if (p.tile) p.tile.srcObject = new MediaStream([track]);
         return;
       }
-      try {
-        await (loading ??= loadMixer());
-        if (!current()) return;
-        attachTrack(p, track);
-      } catch (e) { if (current()) status(`Speakers unavailable: ${e.message}`); }
+      const attach = () => {
+        try { attachTrack(p, track); }
+        catch (e) { status(`Speakers unavailable: ${e.message}`); }
+      };
+      if (mixer) attach();
+      else {
+        p.attachAudio = attach;
+        startPlayback();
+      }
     };
     function attachTrack(p, track) {
       // Chromium needs a playing media element to pull decoded RTP into Web Audio.
@@ -531,6 +553,9 @@ export function startCall(room, lifetime, name, status) {
       }
     } catch (e) {
       if (version !== generation) return;
+      mic?.stop();
+      mic = null;
+      watchTrack(self, null);
       wantMic = false;
       $("mic").textContent = "Unmute";
       audioInfo("Microphone unavailable.");
@@ -562,7 +587,7 @@ export function startCall(room, lifetime, name, status) {
       try { p.ch.send(data); sent++; } catch {}
     }
     if (!sent) return status("Message not sent. Your draft is still here.");
-    const line = append($("chat"), "li", "");
+    const line = chatLine("");
     append(line, "strong", name);
     line.append(`: ${text}`);
     if (sent < peers.size) line.append(" · not sent to everyone");

@@ -8,14 +8,17 @@ import { $, check, run } from "./browser.js";
 await run(async () => {
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   const profile = { "voice.name": "Tester", "voice.identity": "key", "voice.rooms": '["room"]' };
-  Object.defineProperty(window, "localStorage", { value: { getItem: k => profile[k] ?? null } });
+  Object.defineProperty(window, "localStorage", { value: {
+    getItem: k => profile[k] ?? null,
+    setItem: (k, v) => { profile[k] = v; },
+  } });
   let joins = 0, captures = 0, closes = 0, rejectJoin, rejectNext;
   const media = new EventTarget();
   media.enumerateDevices = async () => [];
   media.getUserMedia = async () => { captures++; throw Error("Stub microphone"); };
   Object.defineProperty(navigator, "mediaDevices", { value: media });
   window.wasmBindings = {
-    valid_name: () => true, room_name: s => s,
+    valid_name: () => true, room_name: s => s.split(":").at(-1),
     join: async () => ++joins <= 2 ? new Promise((_, reject) => { rejectJoin = reject; }) : {
       presence_available: () => true,
       next: () => new Promise((_, reject) => { rejectNext = reject; }),
@@ -39,5 +42,16 @@ await run(async () => {
   check(!$("lobby").hidden && closes === 1 && !$("peers").childElementCount, "Terminal failure must tear down call");
   await wait(1100);
   check(!$("lobby").hidden && joins === 4 && captures === 1, "Ended call must retry only the preview");
+  const form = $("import");
+  form.elements.invite.value = "different-invite:room";
+  form.requestSubmit();
+  await wait(0);
+  check(profile["voice.rooms"] === '["room"]' && $("status").textContent.includes("already saved"),
+    "A different invite with the same room name must not be saved");
+  form.elements.invite.value = "room";
+  form.requestSubmit();
+  await wait(0);
+  check(profile["voice.rooms"] === '["room"]' && !form.elements.invite.value,
+    "Importing the exact same invite should still work");
 });
 </script>

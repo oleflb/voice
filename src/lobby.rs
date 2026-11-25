@@ -436,9 +436,14 @@ fn update_peer(
                     }
                     return;
                 }
-                Description::Remove(line) if attempt == p.attempt => {
+                Description::Remove(line) if attempt >= p.attempt => {
                     if let Ok(candidate) = str0m::Candidate::from_sdp_string(line) {
-                        p.signal(Command::Remove(candidate));
+                        p.early_ice.retain(|(id, early)| {
+                            *id != attempt || !peer::same_route(early, &candidate)
+                        });
+                        if attempt == p.attempt {
+                            p.signal(Command::Remove(candidate));
+                        }
                     }
                     return;
                 }

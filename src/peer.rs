@@ -49,8 +49,14 @@ pub struct Inbox {
     pub viewer: watch::Receiver<Option<mpsc::Sender<Frame>>>,
 }
 
-pub fn valid(text: &str) -> bool {
-    !text.trim().is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
+pub const MAX_CHAT_BYTES: usize = 4096;
+
+pub fn valid_chat(text: &str) -> bool {
+    !text.trim().is_empty() && text.len() <= MAX_CHAT_BYTES && !text.chars().any(char::is_control)
+}
+
+pub fn same_route(a: &Candidate, b: &Candidate) -> bool {
+    a.addr() == b.addr() && a.proto() == b.proto() && a.kind() == b.kind()
 }
 
 type Jobs = JoinSet<Result<Option<(Arc<UdpSocket>, Candidate)>>>;
@@ -119,7 +125,7 @@ impl Route {
     fn retire(&self, rtc: &mut Rtc, mut unpublish: impl FnMut(Description)) {
         for c in &self.candidates {
             rtc.direct_api().invalidate_candidate(c);
-            unpublish(Description::Remove(c.to_sdp_string()));
+            unpublish(Description::Remove(self.candidate_line(c)));
         }
     }
     async fn open(
@@ -183,6 +189,10 @@ impl Route {
     }
 
     fn advertise(&self, c: &Candidate) -> Description {
+        Description::Ice(self.candidate_line(c))
+    }
+
+    fn candidate_line(&self, c: &Candidate) -> String {
         // STUN mappings inherit the local preference of the underlying socket.
         let line = c.to_sdp_string();
         let mut fields: Vec<_> = line.split_ascii_whitespace().collect();
@@ -193,7 +203,7 @@ impl Route {
         }
         .to_string();
         fields[3] = &priority;
-        Description::Ice(fields.join(" "))
+        fields.join(" ")
     }
 
     async fn promote(
@@ -313,6 +323,7 @@ impl Link {
     fn command(&mut self, command: Command) -> Result<()> {
         match command {
             Command::Remove(candidate) => {
+                self.early.retain(|early| !same_route(early, &candidate));
                 if !self
                     .routes
                     .iter()
@@ -540,7 +551,7 @@ impl Link {
                     return Ok(());
                 }
                 match serde_json::from_slice(&d.data) {
-                    Ok(Message::Chat { id, text }) if valid(&text) => {
+                    Ok(Message::Chat { id, text }) if valid_chat(&text) => {
                         self.call.state.lock().log(format!("{}: {text}", self.name));
                         // Older clients still display delivery receipts.
                         let _ = self.try_send(Message::Ack { id });

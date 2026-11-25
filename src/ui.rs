@@ -1,8 +1,9 @@
 use crate::{
     audio::Port,
     call::{Call, Status},
-    config::{Room, valid},
+    config::Room,
     lobby::Lobby,
+    peer::{MAX_CHAT_BYTES, valid_chat},
 };
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -25,7 +26,7 @@ struct TextEdit {
 
 impl Default for TextEdit {
     fn default() -> Self {
-        Self::new(1024)
+        Self::new(MAX_CHAT_BYTES)
     }
 }
 
@@ -285,7 +286,7 @@ impl View {
     fn edit(&mut self, form: Form) {
         self.draft = match form {
             Form::Name | Form::RoomName => Some(TextEdit::new(64)),
-            Form::Import => Some(TextEdit::default()),
+            Form::Import => Some(TextEdit::new(1024)),
             Form::Share(_) | Form::Delete | Form::Leave | Form::Devices { .. } => None,
         };
         self.form = Some(form);
@@ -857,7 +858,7 @@ impl View {
             match key {
                 KeyCode::Enter => {
                     if let Some(call) = active
-                        && valid(&self.chat_input.text, 1024)
+                        && valid_chat(&self.chat_input.text)
                     {
                         if call
                             .state
@@ -1209,11 +1210,14 @@ mod tests {
         edit.key(KeyCode::Left);
         edit.key(KeyCode::Delete);
         assert_eq!(edit.text, "a界z");
-        edit.insert(&"x".repeat(1024));
-        assert!(edit.error.contains("1024"));
+        assert_eq!(&edit.text[..edit.cursor], "a界");
+        edit.insert(&"x".repeat(MAX_CHAT_BYTES - edit.text.len()));
+        assert_eq!(edit.text.len(), MAX_CHAT_BYTES);
+        assert!(valid_chat(&edit.text));
+        edit.insert("x");
+        assert!(edit.error.contains(&MAX_CHAT_BYTES.to_string()));
         edit.insert("\n");
         assert!(edit.error.contains("one line"));
-        assert_eq!(&edit.text[..edit.cursor], "a界");
     }
 
     #[tokio::test]

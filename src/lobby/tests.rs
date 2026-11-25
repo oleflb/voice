@@ -32,6 +32,51 @@ fn partial_chat_failure_marks_the_original_line_once() {
     assert!(state.chat.iter().map(|l| l.as_ref()).eq([marked]));
 }
 
+#[tokio::test]
+async fn route_withdrawal_only_removes_candidates_for_its_attempt() -> Result<()> {
+    let relay = MockRelay::run().await?;
+    let saved = Room::new("Routes");
+    let room = Arc::new(
+        voice_core::Room::join(
+            &saved.invite()?,
+            &voice_core::new_secret(),
+            "Local",
+            &relay.url().await.to_string(),
+        )
+        .await?,
+    );
+    let call = Call::new(saved, "Local".into());
+    let key = nostr_sdk::Keys::generate().public_key();
+    let member = Member {
+        identity: key,
+        session: key,
+        name: "Remote".into(),
+        video: false,
+    };
+    let candidate = str0m::Candidate::host("127.0.0.1:1234".parse()?, "udp")?.to_sdp_string();
+    let network = watch::channel(Vec::new()).0;
+    let mut jobs = JoinSet::new();
+    for (attempt, signal) in [
+        (0, Description::Ice(candidate.clone())),
+        (1, Description::Ice(candidate.clone())),
+        (1, Description::Remove(candidate)),
+    ] {
+        update_peer(
+            &call,
+            &room,
+            member.clone(),
+            Some(Update::Signal(Signal::new(attempt, signal))),
+            &network,
+            &mut jobs,
+        );
+    }
+    let state = call.state.lock();
+    let pending = &state.peers[&key].early_ice;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, 0);
+    Ok(())
+}
+
 async fn until(mut ready: impl FnMut() -> bool, message: &str) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(18), async {
         while !ready() {

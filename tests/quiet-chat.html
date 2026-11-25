@@ -43,5 +43,13 @@ await run(async signal => {
   channels.forEach(ch => ch.readyState = "closed");
   send("retry me");
   check($("text").value === "retry me" && $("chat").children.length === 2, "Failed send lost draft");
+  const ch = channels[0];
+  for (let id = 1; id <= 101; id++) ch.onmessage({ data: JSON.stringify({ type: "chat", id, text: `line ${id}` }) });
+  check($("chat").children.length === 100 && $("chat").firstChild.textContent.endsWith("line 2"),
+    "Chat should keep only the newest lines");
+  ch.readyState = "open";
+  send("latest");
+  check($("chat").children.length === 100 && $("chat").firstChild.textContent.endsWith("line 3"),
+    "Sending should use the same history limit");
 });
 </script>

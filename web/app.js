@@ -154,10 +154,12 @@ submit("profile-form", async () => {
 });
 
 async function save(invite, form) {
-  room_name(invite); // Validate before changing storage.
+  const name = room_name(invite);
   await navigator.locks.request("voice.rooms", () => {
     const rooms = saved();
-    if (!rooms.includes(invite)) localStorage.setItem("voice.rooms", JSON.stringify([...rooms, invite]));
+    if (rooms.includes(invite)) return;
+    if (rooms.some(saved => room_name(saved) === name)) throw Error("A room with that name is already saved.");
+    localStorage.setItem("voice.rooms", JSON.stringify([...rooms, invite]));
   });
   selected = invite;
   form.reset();

@@ -14,10 +14,6 @@ pub struct Room {
     pub secret: [u8; 32],
 }
 
-pub fn valid(s: &str, max: usize) -> bool {
-    !s.trim().is_empty() && s.len() <= max && !s.chars().any(char::is_control)
-}
-
 impl Room {
     pub fn new(name: &str) -> Self {
         Self {
