@@ -1,7 +1,7 @@
 use crate::{
     audio::Jitter,
     config::{Levels, Room},
-    peer::Command,
+    peer::{AudioFrame, Command},
 };
 use bytes::Bytes;
 use nostr_sdk::PublicKey;
@@ -35,6 +35,7 @@ pub struct Peer {
     pub jitter: Jitter,
     pub audio_stream: Arc<()>,
     pub control: Option<mpsc::Sender<Command>>,
+    pub audio: Option<mpsc::Sender<AudioFrame>>,
     pub early_ice: Vec<(u32, str0m::Candidate)>,
     pub attempt: u32,
     pub next_retry: Instant,
@@ -44,6 +45,15 @@ pub struct Peer {
 }
 
 impl Peer {
+    pub fn signal(&mut self, command: Command) {
+        if let Some(tx) = &self.control
+            && tx.try_send(command).is_err()
+        {
+            // Wake the link on its independent audio channel to fail and retry this attempt.
+            self.audio = None;
+        }
+    }
+
     pub fn new(member: Member, levels: &Levels) -> Self {
         let volume = levels
             .peers
@@ -61,6 +71,7 @@ impl Peer {
             jitter: Jitter::default(),
             audio_stream: Arc::new(()),
             control: None,
+            audio: None,
             early_ice: Vec::new(),
             attempt: 0,
             next_retry: Instant::now(),
@@ -118,8 +129,8 @@ impl State {
             .values()
             .filter(|p| p.status == Status::Connected)
         {
-            if let Some(tx) = &p.control {
-                let _ = tx.try_send(Command::Audio(at, sample, bytes.clone()));
+            if let Some(tx) = &p.audio {
+                let _ = tx.try_send(AudioFrame(at, sample, bytes.clone()));
             }
         }
     }

@@ -285,17 +285,18 @@ async fn exercise_call(
 
     {
         let mut state = alice.state.lock();
-        state.send_chat(&alice.name, "hello".into());
         let tx = state
             .peers
             .values()
-            .find_map(|peer| peer.control.as_ref())
+            .find_map(|peer| peer.audio.as_ref())
             .context("Alice should have a live link")?;
-        // The peer's command queue is full when Alice unmutes.
+        // Even an overflowing capture queue must leave room for chat and mute.
         let captured = Instant::now();
-        for _ in 0..tx.capacity() {
-            tx.try_send(Command::Audio(captured, 0, Arc::from([])))?;
+        for _ in 0..=tx.max_capacity() {
+            state.send_audio(captured, 0, Arc::from([]));
         }
+        assert_eq!(tx.capacity(), 0);
+        assert!(state.send_chat(&alice.name, "hello"));
         state.set_mic(true);
     }
     until(

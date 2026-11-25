@@ -422,17 +422,13 @@ fn update_peer(
                     None
                 }
                 Description::Answer(sdp) if attempt == p.attempt => {
-                    if let Some(tx) = &p.control {
-                        let _ = tx.try_send(Command::Answer(sdp.clone()));
-                    }
+                    p.signal(Command::Answer(sdp.clone()));
                     return;
                 }
                 Description::Ice(line) if attempt >= p.attempt => {
                     if let Ok(candidate) = str0m::Candidate::from_sdp_string(line) {
-                        if attempt == p.attempt
-                            && let Some(tx) = &p.control
-                        {
-                            let _ = tx.try_send(Command::Ice(candidate));
+                        if attempt == p.attempt && p.control.is_some() {
+                            p.signal(Command::Ice(candidate));
                         } else if p.early_ice.len() < 32 {
                             p.early_ice.push((attempt, candidate));
                         }
@@ -440,10 +436,8 @@ fn update_peer(
                     return;
                 }
                 Description::Remove(line) if attempt == p.attempt => {
-                    if let Ok(candidate) = str0m::Candidate::from_sdp_string(line)
-                        && let Some(tx) = &p.control
-                    {
-                        let _ = tx.try_send(Command::Remove(candidate));
+                    if let Ok(candidate) = str0m::Candidate::from_sdp_string(line) {
+                        p.signal(Command::Remove(candidate));
                     }
                     return;
                 }
@@ -460,17 +454,25 @@ fn update_peer(
     let (tx, rx) = mpsc::channel(64);
     for (id, candidate) in p.early_ice.drain(..) {
         if id == attempt {
-            let _ = tx.try_send(Command::Ice(candidate));
+            tx.try_send(Command::Ice(candidate))
+                .expect("at most 32 early candidates fit in the new 64-slot control queue");
         }
     }
     let owner = tx.downgrade();
     p.control = Some(tx);
+    let (audio, frames) = mpsc::channel(4);
+    p.audio = Some(audio);
+    let inbox = peer::Inbox {
+        control: rx,
+        audio: frames,
+    };
     p.status = Status::Connecting;
     let call = call.clone();
     let room = room.clone();
     let network = network.subscribe();
     jobs.spawn(async move {
-        let result = peer::connect(network, room, member, offer, attempt, call.clone(), rx).await;
+        let result =
+            peer::connect(network, room, member, offer, attempt, call.clone(), inbox).await;
         let mut state = call.state.lock();
         if let Some(p) = state.peers.get_mut(&id)
             && p.control
@@ -485,6 +487,7 @@ fn update_peer(
                 Status::Failed
             };
             p.control = None;
+            p.audio = None;
         }
         if let Err(e) = result {
             state.notify(format!("Connection failed: {e}"));

@@ -37,7 +37,13 @@ pub enum Command {
     Ice(Candidate),
     Remove(Candidate),
     Chat(u32, String),
-    Audio(Instant, u64, Arc<[u8]>),
+}
+
+pub struct AudioFrame(pub Instant, pub u64, pub Arc<[u8]>);
+
+pub struct Inbox {
+    pub control: mpsc::Receiver<Command>,
+    pub audio: mpsc::Receiver<AudioFrame>,
 }
 
 pub fn valid(text: &str) -> bool {
@@ -328,29 +334,31 @@ impl Link {
                     self.call.state.lock().mark_chat_failed(id);
                 }
             }
-            Command::Audio(at, sample, data) => {
-                {
-                    let state = self.call.state.lock();
-                    if *state.muted.borrow()
-                        || state.closed
-                        || state.mic_changed_at.is_some_and(|change| at < change)
-                    {
-                        return Ok(());
-                    }
-                }
-                if self.channel.is_some()
-                    && let Some(writer) = self.audio.and_then(|mid| self.rtc.writer(mid))
-                {
-                    let pt = writer.payload_params().next().map(|p| p.pt());
-                    if let Some(pt) = pt {
-                        writer.write(
-                            pt,
-                            at,
-                            MediaTime::new(sample, Frequency::FORTY_EIGHT_KHZ),
-                            data,
-                        )?;
-                    }
-                }
+        }
+        Ok(())
+    }
+
+    fn send_audio(&mut self, AudioFrame(at, sample, data): AudioFrame) -> Result<()> {
+        {
+            let state = self.call.state.lock();
+            if *state.muted.borrow()
+                || state.closed
+                || state.mic_changed_at.is_some_and(|change| at < change)
+            {
+                return Ok(());
+            }
+        }
+        if self.channel.is_some()
+            && let Some(writer) = self.audio.and_then(|mid| self.rtc.writer(mid))
+        {
+            let pt = writer.payload_params().next().map(|p| p.pt());
+            if let Some(pt) = pt {
+                writer.write(
+                    pt,
+                    at,
+                    MediaTime::new(sample, Frequency::FORTY_EIGHT_KHZ),
+                    data,
+                )?;
             }
         }
         Ok(())
@@ -440,7 +448,7 @@ impl Link {
 
     async fn drive(
         &mut self,
-        mut commands: mpsc::Receiver<Command>,
+        mut inbox: Inbox,
         room: Arc<Room>,
         member: Member,
         description: Description,
@@ -477,7 +485,7 @@ impl Link {
         let mut mute = self.call.state.lock().muted.subscribe();
         let mut sent_mute = None;
         let mut order = self.routes.len();
-        while self.rtc.is_alive() && !commands.is_closed() {
+        while self.rtc.is_alive() && !inbox.control.is_closed() {
             let deadline = loop {
                 let muted = *mute.borrow_and_update();
                 // Keep the latest state pending if SCTP is temporarily full.
@@ -587,7 +595,12 @@ impl Link {
                         }
                     }
                 }
-                cmd = commands.recv() => match cmd { Some(cmd) => self.command(cmd)?, None => break },
+                cmd = inbox.control.recv() => match cmd { Some(cmd) => self.command(cmd)?, None => break },
+                frame = inbox.audio.recv() => match frame {
+                    Some(frame) => self.send_audio(frame)?,
+                    None if inbox.control.is_closed() => break,
+                    None => bail!("peer control queue overflow"),
+                },
                 (i, incoming) = receive(&self.routes, &mut buffer) => {
                     let (source, n) = match incoming {
                         Ok(packet) => packet,
@@ -653,7 +666,7 @@ pub async fn connect(
     offer: Option<String>,
     attempt: u32,
     call: Arc<Call>,
-    commands: mpsc::Receiver<Command>,
+    inbox: Inbox,
 ) -> Result<()> {
     let mut rtc = new_rtc(Instant::now());
     let mut routes = Vec::new();
@@ -710,6 +723,6 @@ pub async fn connect(
         session: member.session,
         name: member.name.clone(),
     };
-    link.drive(commands, room, member, description, network, jobs)
+    link.drive(inbox, room, member, description, network, jobs)
         .await
 }
