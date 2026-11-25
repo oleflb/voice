@@ -646,13 +646,13 @@ impl View {
                 "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nm enable mic · t chat · Esc leave · q quit"
             }
             Pane::People if !audio_available => {
-                "Alt+arrows/hjkl focus · arrows/hjkl select · m enable mic · t chat · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · arrows/hjkl select · m enable mic · t chat\nv watch · Esc leave · q quit"
             }
             Pane::Sessions => {
                 "Alt+arrows/hjkl focus · arrows/hjkl select · Enter join · n new · i import · s share · d delete\nt chat · m mic mute · Esc leave · q quit"
             }
             Pane::People => {
-                "Alt+arrows/hjkl focus · hover or arrows/hjkl select · +/- selected level\nx mute participant · m mic mute · t chat · Esc leave · q quit"
+                "Alt+arrows/hjkl focus · hover or arrows/hjkl select · +/- selected level\nx mute participant · m mic mute · t chat · v watch · Esc leave · q quit"
             }
         };
         let help = if self.focus == Pane::Chat && !self.chat_input.error.is_empty() {
@@ -973,6 +973,10 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
     let had_terminal = std::io::stdout().is_terminal();
     let mut terminal = ratatui::try_init()?;
     let mut view = View::default();
+    let mut viewer: Option<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    )> = None;
     if lobby.config.name.is_empty() {
         view.edit(Form::Name);
     }
@@ -1000,11 +1004,51 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
                 }
             })?;
         let mut mouse_enabled = false;
+        let mut input_error = None;
         loop {
-            if *quitting.borrow() || (had_terminal && !std::io::stdout().is_terminal()) {
+            let quit = *quitting.borrow() || (had_terminal && !std::io::stdout().is_terminal());
+            if !quit {
+                lobby.update_audio()?;
+            }
+            if let Some((job, stop)) = &viewer {
+                if !job.is_finished() {
+                    if quit {
+                        stop.send_replace(true);
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    match input.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers == KeyModifiers::CONTROL
+                            {
+                                shutdown.request();
+                                stop.send_replace(true);
+                            } else if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'v')) {
+                                stop.send_replace(true);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            input_error = Some(error);
+                            shutdown.request();
+                            stop.send_replace(true);
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            shutdown.request();
+                            stop.send_replace(true);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                viewer = None;
+                if !quit {
+                    terminal.clear()?;
+                }
+            }
+            if quit {
                 break;
             }
-            lobby.update_audio()?;
             // Device probing can print backend diagnostics directly to the terminal.
             if lobby
                 .active
@@ -1030,6 +1074,59 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
                 Err(RecvTimeoutError::Disconnected) => break,
             };
             match event {
+                Event::Key(key)
+                    if key.code == KeyCode::Char('v')
+                        && key.kind == KeyEventKind::Press
+                        && key.modifiers.is_empty()
+                        && view.form.is_none()
+                        && view.focus == Pane::People =>
+                {
+                    if let LevelRow::Peer(id) = view.selected
+                        && let Some(call) = lobby.active.borrow().clone()
+                    {
+                        let mut state = call.state.lock();
+                        if let Some(peer) = state
+                            .peers
+                            .get_mut(&id)
+                            .filter(|p| p.sharing && p.status == Status::Connected)
+                        {
+                            let (tx, frames) = tokio::sync::mpsc::channel(crate::video::QUEUE);
+                            let (stop, quit) = tokio::sync::watch::channel(false);
+                            let control = peer.control.as_ref().map(|tx| tx.downgrade());
+                            peer.viewer.send_replace(Some(tx));
+                            drop(state);
+                            terminal.clear()?;
+                            crossterm::execute!(
+                                std::io::stdout(),
+                                event::DisableMouseCapture,
+                                crossterm::cursor::MoveTo(0, 0),
+                                crossterm::style::Print("Waiting for video…  Esc to return")
+                            )?;
+                            mouse_enabled = false;
+                            viewer = Some((
+                                tokio::spawn(async move {
+                                    let result = crate::video::play(frames, quit, || {
+                                        if let Some(tx) =
+                                            control.as_ref().and_then(|tx| tx.upgrade())
+                                        {
+                                            let _ =
+                                                tx.try_send(crate::peer::Command::VideoKeyframe);
+                                        }
+                                    })
+                                    .await;
+                                    let mut state = call.state.lock();
+                                    if let Some(peer) = state.peers.get_mut(&id) {
+                                        peer.viewer.send_replace(None);
+                                    }
+                                    if let Err(error) = result {
+                                        state.notify(format!("Video: {error:#}"));
+                                    }
+                                }),
+                                stop,
+                            ));
+                        }
+                    }
+                }
                 Event::Mouse(mouse)
                     if capture
                         && matches!(
@@ -1061,7 +1158,7 @@ pub fn run(lobby: &mut Lobby, shutdown: &crate::shutdown::Shutdown) -> Result<()
                 _ => {}
             }
         }
-        Ok(())
+        input_error.map_or(Ok(()), |error| Err(error.into()))
     })();
     shutdown.request();
     if had_terminal && !std::io::stdout().is_terminal() {

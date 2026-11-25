@@ -38,6 +38,7 @@ pub enum Command {
     Ice(Candidate),
     Remove(Candidate),
     Chat(u32, String),
+    VideoKeyframe,
 }
 
 pub struct AudioFrame(pub Instant, pub u64, pub Arc<[u8]>);
@@ -338,6 +339,7 @@ impl Link {
                     self.early.push(candidate);
                 }
             }
+            Command::VideoKeyframe => self.request_video_key(),
             Command::Chat(id, text) => {
                 if !matches!(self.try_send(Message::Chat { id, text }), Ok(true)) {
                     self.call.state.lock().mark_chat_failed(id);
