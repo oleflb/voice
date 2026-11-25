@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser room recovery regression</title>
+<pre>Running…</pre>
+<!-- Serve the repo on localhost. No relay, saved profile, or microphone is used. -->
+<script type="module">
+import { $, check, run } from "./browser.js";
+await run(async () => {
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const profile = { "voice.name": "Tester", "voice.identity": "key", "voice.rooms": '["room"]' };
+  Object.defineProperty(window, "localStorage", { value: { getItem: k => profile[k] ?? null } });
+  let joins = 0, captures = 0, closes = 0, rejectJoin, rejectNext;
+  const media = new EventTarget();
+  media.enumerateDevices = async () => [];
+  media.getUserMedia = async () => { captures++; throw Error("Stub microphone"); };
+  Object.defineProperty(navigator, "mediaDevices", { value: media });
+  window.wasmBindings = {
+    valid_name: () => true, room_name: s => s,
+    join: async () => ++joins <= 2 ? new Promise((_, reject) => { rejectJoin = reject; }) : {
+      presence_available: () => true,
+      next: () => new Promise((_, reject) => { rejectNext = reject; }),
+      close: async () => { closes++; }, depart: async () => {}, query: async () => {}, announce: async () => {},
+    },
+  };
+  await import("../web/app.js");
+  $("join").click();
+  rejectJoin(Error("Offline"));
+  await wait(0);
+  check(!$("call").hidden && captures === 0, "Failed join must stay pending without capture");
+  $("leave").click();
+  await wait(1100);
+  check(!$("lobby").hidden && joins === 2 && captures === 0, "Leave must cancel active retry and open only a preview");
+  $("join").click();
+  rejectJoin(Error("Offline again"));
+  await wait(1100);
+  check(!$("call").hidden && joins === 3 && captures === 1, "Pending join must retry and start the microphone once");
+  rejectNext(Error("Receiver closed"));
+  await wait(0);
+  check(!$("lobby").hidden && closes === 1 && !$("peers").childElementCount, "Terminal failure must tear down call");
+  await wait(1100);
+  check(!$("lobby").hidden && joins === 4 && captures === 1, "Ended call must retry only the preview");
+});
+</script>

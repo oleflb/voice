@@ -8,7 +8,7 @@ const { create_invite, installation_key, join, room_name, valid_name } =
 const $ = id => document.getElementById(id);
 const status = text => { $("status").textContent = text; };
 const relay = new URL(location.href).searchParams.get("relay") ?? "";
-let current, selected, enter;
+let current, selected, enter, retryTimer;
 
 function view(id, heading) {
   for (const panel of ["profile", "lobby", "call"]) $(panel).hidden = panel !== id;
@@ -19,12 +19,13 @@ function view(id, heading) {
 }
 
 function stop() {
+  clearTimeout(retryTimer);
   current?.abort();
   current = null;
   enter = null;
 }
 
-async function openRoom(active) {
+async function openRoom(active, retryDelay = 1000) {
   if (active && enter && selected === $("rooms").value) { enter(); return; }
   stop();
   selected = $("rooms").value;
@@ -38,6 +39,7 @@ async function openRoom(active) {
   function start() {
     if (started || !active || !room) return;
     started = true;
+    retryDelay = 1000;
     clearInterval(rosterTimer);
     report("");
     receive = startCall(room, signal, name, report);
@@ -58,10 +60,11 @@ async function openRoom(active) {
     room = await join(selected, localStorage.getItem("voice.identity"), name, relay);
     if (signal.aborted) { await room.close(); return; }
     signal.addEventListener("abort", async () => {
+      let timeout;
       try {
-        if (started) await Promise.race([room.depart(), new Promise(r => setTimeout(r, 1000))]);
+        if (started) await Promise.race([room.depart(), new Promise(r => { timeout = setTimeout(r, 1000); })]);
       } catch { /* Heartbeat expiry handles an unreachable relay. */ }
-      finally { await room.close(); }
+      finally { clearTimeout(timeout); await room.close(); }
     }, { once: true });
     start();
     if (!active) {
@@ -75,9 +78,18 @@ async function openRoom(active) {
       if (!signal.aborted) receive(member, update);
     }
   } catch (e) {
-    if (!signal.aborted) enter = null;
-    if (!signal.aborted && !active) $("roster").textContent = "Presence unavailable";
-    report(e.message);
+    if (signal.aborted) return;
+    stop();
+    const retryCall = active && !started;
+    if (retryCall) {
+      status(`Could not join: ${e.message}. Retrying…`);
+    } else if (started) {
+      view("lobby", "Lobby");
+      $("join").focus();
+      status(`Call ended: ${e.message}. Select Join room to try again.`);
+      $("roster").textContent = "Retrying presence…";
+    } else $("roster").textContent = `Presence unavailable: ${e.message}. Retrying…`;
+    retryTimer = setTimeout(() => openRoom(retryCall, Math.min(retryDelay * 2, 30000)), retryDelay);
   }
 }
 
