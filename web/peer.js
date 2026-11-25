@@ -16,7 +16,44 @@ export function startCall(room, lifetime, name, status) {
   const stun = new URL(location.href).searchParams.get("stun") ?? "stun.cloudflare.com:3478";
   const peers = new Map();
   let mic, nextId = 0, heartbeat;
-  let context;
+  let context, loading, mixer, player;
+  const enable = $("enable-playback");
+  function audioContext() {
+    return context ??= new AudioContext({ sampleRate: 48000 });
+  }
+  async function play() {
+    try {
+      await route(player);
+      if (lifetime.aborted) return;
+      enable.hidden = context.state === "running";
+      await Promise.all([context.resume(), player.play()]);
+      if (!lifetime.aborted) enable.hidden = true;
+    } catch (e) {
+      if (!lifetime.aborted) {
+        enable.hidden = false;
+        status(`Speakers unavailable: ${e.message}`);
+      }
+    }
+  }
+  enable.onclick = play;
+  async function loadMixer() {
+    const ctx = audioContext();
+    const [module] = await Promise.all([
+      WebAssembly.compileStreaming(fetch(new URL("./playback.wasm", import.meta.url))),
+      ctx.audioWorklet.addModule(new URL("./playback.js", import.meta.url)),
+    ]);
+    if (lifetime.aborted) return;
+    mixer = new AudioWorkletNode(ctx, "voice-playback", {
+      numberOfInputs: 5, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit",
+      processorOptions: { module },
+    });
+    mixer.onprocessorerror = () => status("Speaker processing stopped. Rejoin the call to restart it.");
+    const sink = ctx.createMediaStreamDestination();
+    mixer.connect(sink);
+    player = append($("call"), "audio", "");
+    player.srcObject = sink.stream;
+    play();
+  }
   function meter(parent) {
     const icon = append(parent, "span", "");
     icon.className = "voice-icon";
@@ -36,8 +73,7 @@ export function startCall(room, lifetime, name, status) {
     m.source = m.analyser = null;
     m.until = 0;
     if (!track) return;
-    context ??= new AudioContext();
-    m.source = context.createMediaStreamSource(new MediaStream([track]));
+    m.source = audioContext().createMediaStreamSource(new MediaStream([track]));
     m.analyser = context.createAnalyser();
     m.analyser.fftSize = 512;
     m.source.connect(m.analyser); // Measure before playback volume; never feed the speakers.
@@ -86,7 +122,11 @@ export function startCall(room, lifetime, name, status) {
     p.button.disabled = true;
     for (const item of p.pending.values()) item.append(" · delivery unknown");
     p.pending.clear();
-    p.player?.remove();
+    if (p.slot !== undefined) {
+      mixer.port.postMessage({ slot: p.slot, volume: -1 });
+      delete p.slot;
+    }
+    if (p.receiver) p.receiver.srcObject = null;
     p.volume?.remove();
   }
   function channel(p, ch) {
@@ -146,11 +186,28 @@ export function startCall(room, lifetime, name, status) {
     };
     p.timer = setTimeout(() => finish(p, "connection failed"), 30000);
     pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") finish(p, "connection failed"); };
-    pc.ontrack = ({ track }) => {
-      const player = p.player = append(p.row, "audio", "");
-      player.srcObject = new MediaStream([track]);
-      play(player);
+    pc.ontrack = async ({ track }) => {
+      try {
+        await (loading ??= loadMixer());
+        if (p.ended || lifetime.aborted) return;
+        attachTrack(p, track);
+      } catch (e) { status(`Speakers unavailable: ${e.message}`); }
+    };
+    function attachTrack(p, track) {
+      // Chromium needs a playing media element to pull decoded RTP into Web Audio.
+      p.receiver ??= new Audio();
+      p.receiver.muted = true;
+      p.receiver.autoplay = true;
+      p.receiver.srcObject = new MediaStream([track]);
       watchTrack(p.meter, track);
+      if (p.slot !== undefined) {
+        p.meter.source.connect(mixer, 0, p.slot);
+        return;
+      }
+      let slot = 0;
+      while ([...peers.values()].some(peer => peer.slot === slot)) slot++;
+      p.slot = slot;
+      p.meter.source.connect(mixer, 0, slot);
       const panel = p.volume = append(p.row, "div", "");
       panel.popover = "auto";
       panel.className = "user-volume";
@@ -174,20 +231,19 @@ export function startCall(room, lifetime, name, status) {
       slider.autofocus = true;
       slider.setAttribute("aria-label", `Volume for ${p.name}`);
       const key = `voice.volume.${p.member.identity}`;
-      const stored = Number(localStorage.getItem(key) ?? 1);
-      player.volume = Number.isFinite(stored) ? Math.min(1, Math.max(0, stored)) : 1;
-      slider.value = Math.round(player.volume * 100);
+      const stored = Number(localStorage.getItem(`${key}.leveled`) ?? Number(localStorage.getItem(key) ?? 1) / 2);
+      slider.value = Math.round(100 * (Number.isFinite(stored) ? Math.min(1, Math.max(0, stored)) : 0.5));
       function showPercent() {
+        mixer.port.postMessage({ slot, volume: slider.valueAsNumber / 100 });
         percent.textContent = `${slider.value}%`;
         slider.setAttribute("aria-valuetext", percent.textContent);
       }
       showPercent();
       slider.oninput = () => {
-        player.volume = slider.valueAsNumber / 100;
-        localStorage.setItem(key, player.volume);
+        localStorage.setItem(`${key}.leveled`, slider.valueAsNumber / 100);
         showPercent();
       };
-    };
+    }
     if (offer) {
       pc.ondatachannel = ({ channel: ch }) => channel(p, ch);
       await pc.setRemoteDescription(JSON.parse(offer));
@@ -249,21 +305,20 @@ export function startCall(room, lifetime, name, status) {
     audioInfo("");
     clearTimeout(heartbeat);
     for (const p of peers.values()) finish(p, "left");
+    mixer?.disconnect();
+    player?.pause();
+    if (player) player.srcObject = null;
+    player?.remove();
+    enable.hidden = true;
+    enable.onclick = null;
     context?.close();
     $("chat").replaceChildren();
     $("peers").replaceChildren();
     $("compose").reset();
     $("compose").onsubmit = $("mic").onclick = null;
   }, { once: true });
-  async function play(player) {
-    player.pause();
-    try {
-      await route(player);
-      if (!lifetime.aborted && player.isConnected) await player.play().catch(() => { player.controls = true; });
-    } catch (e) { status(`Speakers unavailable: ${e.message}`); }
-  }
   output.addEventListener("change", () => {
-    for (const p of peers.values()) if (p.player) play(p.player);
+    if (player) play();
   }, { signal: lifetime });
 
   let generation = 0, wantMic = true;

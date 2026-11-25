@@ -7,6 +7,7 @@
   <link data-trunk rel="rust" href="../crates/voice-core/Cargo.toml">
   <link data-trunk rel="css" href="style.css">
   <link data-trunk rel="copy-file" href="peer.js">
+  <link data-trunk rel="copy-file" href="playback.js">
   <link data-trunk rel="copy-file" href="devices.js">
 </head>
 <body><main>
@@ -30,6 +31,7 @@
     </div>
   </section>
   <section id="call" hidden>
+    <button id="enable-playback" hidden>Enable speakers</button>
     <div class="bar"><h2 id="title"></h2><div class="actions"><button id="mic" disabled>Mute</button><button id="share">Copy invite</button><button id="leave">Leave</button></div></div>
     <div class="columns room">
       <section><h3>Participants</h3><ul id="peers"></ul></section>
