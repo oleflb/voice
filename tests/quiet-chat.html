@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Chat during a signaling outage</title>
+<pre>Running…</pre>
+<script type="module">
+import { $, check, run } from "./browser.js";
+await run(async signal => {
+  Object.defineProperty(navigator, "mediaDevices", { value: undefined });
+  const channels = [];
+  window.RTCPeerConnection = class {
+    connectionState = "connected";
+    addTransceiver() { return { sender: { replaceTrack() {} } }; }
+    createDataChannel(label) {
+      const ch = { label, readyState: "open", send(data) { this.last = JSON.parse(data); } };
+      channels.push(ch); return ch;
+    }
+    createOffer() { return { type: "offer" }; }
+    setLocalDescription(sdp) { this.localDescription = sdp; }
+    close() {}
+  };
+  const { startCall } = await import("../web/peer.js");
+  let offline = true;
+  const receive = startCall({ send() {}, async announce() { if (offline) throw Error("offline"); } },
+    signal, "Alice", () => {});
+  const send = text => { $("text").value = text; $("compose").requestSubmit(); };
+  for (let n = 0; n < 5; n++) receive({ session: `${n}`, name: `peer${n}` }, { Presence: { dial: true } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  send("hello");
+  for (const ch of channels) {
+    check(ch.last.text === "hello", "Peer missed message");
+    ch.onmessage({ data: JSON.stringify({ type: "ack", id: ch.last.id }) });
+  }
+  check(channels.length === 5 && $("chat").textContent === "Alice: hello" && $("chat").children.length === 1,
+    "Receipts or relay failures polluted the transcript");
+  check($("discovery").textContent === "Room discovery unavailable", "Missing outage indication");
+  offline = false;
+  receive({}, "Query");
+  await Promise.resolve();
+  check(!$("discovery").textContent, "Relay warning did not clear");
+  channels[0].readyState = "closed";
+  send("partial");
+  check($("chat").lastChild.textContent === "Alice: partial · not sent to everyone", "Missing partial-send warning");
+  channels.forEach(ch => ch.readyState = "closed");
+  send("retry me");
+  check($("text").value === "retry me" && $("chat").children.length === 2, "Failed send lost draft");
+});
+</script>

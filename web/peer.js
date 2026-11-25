@@ -124,8 +124,6 @@ export function startCall(room, lifetime, name, status) {
     watchTrack(p.meter, null);
     p.muted = false;
     p.button.disabled = true;
-    for (const item of p.pending.values()) item.append(" · delivery unknown");
-    p.pending.clear();
     if (p.slot !== undefined) {
       mixer.port.postMessage({ slot: p.slot, volume: -1 });
       delete p.slot;
@@ -155,10 +153,8 @@ export function startCall(room, lifetime, name, status) {
       if (!Number.isInteger(msg?.id) || msg.id < 1 || msg.id > 0xffffffff) return;
       if (msg.type === "chat" && valid(msg.text)) {
         append($("chat"), "li", `${p.name}: ${msg.text}`);
-        ch.send(JSON.stringify({ type: "ack", id: msg.id }));
-      } else if (msg.type === "ack" && p.pending.has(msg.id)) {
-        p.pending.get(msg.id).append(" · delivered");
-        p.pending.delete(msg.id);
+        // Older clients expect a receipt. A lost receipt doesn't affect the call.
+        try { ch.send(JSON.stringify({ type: "ack", id: msg.id })); } catch {}
       }
     };
   }
@@ -339,7 +335,7 @@ export function startCall(room, lifetime, name, status) {
       button.disabled = true;
       button.title = `Adjust volume for ${name}`;
       append(button, "span", name).className = "participant-name";
-      p = { member, name, row, button, attempt, failures: 0, seen: performance.now(), meter: meter(button), label: append(button, "span", ""), pending: new Map(), candidates: new Set(), work: Promise.resolve() };
+      p = { member, name, row, button, attempt, failures: 0, seen: performance.now(), meter: meter(button), label: append(button, "span", ""), candidates: new Set(), work: Promise.resolve() };
       p.label.className = "connection";
       p.label.setAttribute("role", "img");
       connection(p);
@@ -455,19 +451,18 @@ export function startCall(room, lifetime, name, status) {
     event.preventDefault();
     const text = $("text").value;
     if (!valid(text)) return status("Use 1–4096 bytes of plain text");
-    if (!peers.size) return status("No recipients");
-    const id = ++nextId;
+    const data = JSON.stringify({ type: "chat", id: nextId = nextId % 0xffffffff + 1, text });
+    let sent = 0;
+    for (const p of peers.values()) {
+      if (!connected(p)) continue;
+      try { p.ch.send(data); sent++; } catch {}
+    }
+    if (!sent) return status("Message not sent. Your draft is still here.");
     const line = append($("chat"), "li", "");
     append(line, "strong", name);
     line.append(`: ${text}`);
-    for (const p of peers.values()) {
-      const receipt = append(line, "small", p.name);
-      if (p.ch?.readyState !== "open" || p.pending.size >= 100) { receipt.append(" · not sent"); continue; }
-      try {
-        p.ch.send(JSON.stringify({ type: "chat", id, text }));
-        p.pending.set(id, receipt);
-      } catch { receipt.append(" · not sent"); }
-    }
+    if (sent < peers.size) line.append(" · not sent to everyone");
+    status("");
     $("text").value = "";
   };
   announce();
